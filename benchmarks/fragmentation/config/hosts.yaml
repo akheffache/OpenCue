@@ -1,0 +1,33 @@
+# Host configuration for render farm simulation
+# Based on real production data
+
+hosts:
+  elk:
+    count: 1004
+    cores: 16
+    memory_gb: 125
+    tags:
+      - general
+      - render
+
+  ram:
+    count: 303
+    cores: 32
+    memory_gb: 251
+    tags:
+      - general
+      - render
+      - midrange
+
+  jaime:
+    count: 246
+    cores: 128
+    memory_gb: 503
+    tags:
+      - general
+      - render
+      - highend
+
+# Totals:
+# - 1,553 hosts
+# - 57,248 cores (16,064 + 9,696 + 31,488)

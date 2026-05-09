@@ -1,0 +1,43 @@
+# Frame distribution configuration
+# Based on real production data (power-of-2 cores only)
+
+frame_types:
+  - cores: 1
+    percent: 22.89
+    memory_gb: 0.52
+
+  - cores: 2
+    percent: 25.54
+    memory_gb: 1.38
+
+  - cores: 4
+    percent: 34.22
+    memory_gb: 6.44
+
+  - cores: 8
+    percent: 14.55
+    memory_gb: 27.27
+
+  - cores: 16
+    percent: 1.88
+    memory_gb: 63.85
+
+  - cores: 32
+    percent: 0.28
+    memory_gb: 109.00
+
+  - cores: 64
+    percent: 0.03
+    memory_gb: 233.12
+
+# Job priorities to use (5 levels)
+priorities:
+  - 10
+  - 30
+  - 50
+  - 70
+  - 90
+
+# Target utilization for simulation
+# 0.20 = create enough frames to use 20% of total farm cores
+target_utilization: 0.20
