@@ -664,19 +664,24 @@ Boolean acquired = redisTemplate.opsForValue()
 
 **What happens:**
 ```
-T0: Frame starts → limit:render:running = 10
+T0: Frame starts → limit:render:running = 10 (SQL and Redis both increment)
 T1: RQD crashes, frame orphaned
 T2: FrameCompleteHandler never called
-T3: limit:render:running stuck at 10 (should be 9)
+T3: Both SQL and Redis still show running = 10 (correctly in sync!)
+T4: MaintenanceManagerSupport detects orphan after 5 min
+T5: frameDao.updateFrameStopped() → fires FrameStateChangedEvent(RUNNING→WAITING)
+T6: Redis listener decrements: limit:render:running = 9
 ```
 
-**Impact:** Limit appears more used than it is → fewer frames dispatched than allowed.
+**Impact:** During the 5-minute orphan detection window, limit appears more used than it should be.
 
 **Recovery:**
-- Cuebot restart recalculates from SQL: `SUM(layer_stat.int_running_count)`
-- Orphan detection eventually marks frame as DEAD, triggering proper completion
+- **Automatic via orphan detection:** `MaintenanceManagerSupport.clearOrphanedProcs()` runs periodically
+- When orphan is cleaned, `updateFrameStopped()` fires proper event
+- Redis listener sees `wasRunning && !isRunning` → decrements counter
+- No manual intervention needed!
 
-**Worst case:** Slightly reduced throughput until restart or orphan cleanup.
+**Worst case:** Slightly reduced throughput for up to 5 minutes (same as SQL behavior).
 
 ---
 
@@ -838,7 +843,7 @@ T3: loadWaitingFrames() completes
 | Redis connection lost | SQL fallback | Automatic | Immediate |
 | Event dropped | Single frame via SQL | Logs | Next restart |
 | Race in waiting set | One cycle SQL fallback | None needed | Self-healing |
-| Limit counter drift | Reduced throughput | Monitor metrics | Restart or orphan cleanup |
+| Limit counter drift | Reduced throughput | Monitor metrics | Auto (orphan detection, ~5 min) |
 | Stale layer metadata | Wasted booking attempts | Logs | Restart |
 | Redis down | Full SQL fallback | Health check | When Redis returns |
 | Partial load | Partial SQL fallback | Logs | Restart |
@@ -856,25 +861,7 @@ T3: loadWaitingFrames() completes
 
 The current implementation relies too heavily on "restart to fix". Here are runtime recovery mechanisms to implement:
 
-#### 1. Periodic Limit Counter Resync
-
-**Problem:** Limit counters can drift due to orphaned frames or missed events.
-
-**Solution:** Scheduled task every 5 minutes:
-```java
-@Scheduled(fixedRate = 300000) // 5 minutes
-public void resyncLimitCounters() {
-    // Query SQL: SELECT limit_id, SUM(int_running_count) FROM layer_stat GROUP BY limit_id
-    // Compare with Redis: GET limit:{id}:running
-    // Fix any drift
-}
-```
-
-**Benefit:** Limit drift self-corrects within 5 minutes, no restart needed.
-
----
-
-#### 2. Per-Job Cache Reload API
+#### 1. Per-Job Cache Reload API
 
 **Problem:** Stale layer metadata requires restart to fix.
 
@@ -897,7 +884,7 @@ public void reloadJobCache(String jobId) {
 
 ---
 
-#### 3. Automatic Stale Detection
+#### 2. Automatic Stale Detection
 
 **Problem:** Redis can have frames that no longer exist in SQL.
 
@@ -920,7 +907,7 @@ if (frames.isEmpty() && redisDispatchCache.hasJobData(job.getJobId())) {
 
 ---
 
-#### 4. Cache Freshness TTL
+#### 3. Cache Freshness TTL
 
 **Problem:** Layer metadata changes might not trigger events.
 
@@ -939,7 +926,7 @@ end
 
 ---
 
-#### 5. Health Check with Auto-Repair
+#### 4. Health Check with Auto-Repair
 
 **Problem:** Drift accumulates silently.
 
@@ -962,10 +949,10 @@ public void healthCheck() {
 
 | Failure | Current Recovery | With Runtime Fixes |
 |---------|------------------|-------------------|
-| Event dropped | Restart | Auto-heal on stale detection (#3) |
-| Limit counter drift | Restart | Periodic resync (#1) |
-| Stale layer metadata | Restart | TTL expiry (#4) or admin API (#2) |
-| Partial load | Restart | Health check triggers reload (#5) |
+| Event dropped | Restart | Auto-heal on stale detection (#2) |
+| Limit counter drift | Automatic | Already handled by orphan detection! |
+| Stale layer metadata | Restart | TTL expiry (#3) or admin API (#1) |
+| Partial load | Restart | Health check triggers reload (#4) |
 
 **Goal:** Reduce "restart required" scenarios to near-zero through proactive self-healing.
 
