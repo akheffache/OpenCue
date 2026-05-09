@@ -43,14 +43,19 @@ HOSTS_CONFIG = {
 }
 
 # Frame distribution (power-of-2 cores only)
+# Tags determine which hosts can run the frame (OR logic - host needs ANY matching tag)
+# - general: runs on any host
+# - render: runs on any host (all have render tag)
+# - midrange|highend: needs ram (32-core) or jaime (128-core) hosts
+# - highend: needs jaime hosts only (128-core, 503GB)
 FRAME_TYPES_CONFIG = [
-    {"cores": 1, "percent": 22.89, "memory_gb": 0.52},
-    {"cores": 2, "percent": 25.54, "memory_gb": 1.38},
-    {"cores": 4, "percent": 34.22, "memory_gb": 6.44},
-    {"cores": 8, "percent": 14.55, "memory_gb": 27.27},
-    {"cores": 16, "percent": 1.88, "memory_gb": 63.85},
-    {"cores": 32, "percent": 0.28, "memory_gb": 109.00},
-    {"cores": 64, "percent": 0.03, "memory_gb": 233.12},
+    {"cores": 1, "percent": 22.89, "memory_gb": 0.52, "tags": "general"},
+    {"cores": 2, "percent": 25.54, "memory_gb": 1.38, "tags": "general"},
+    {"cores": 4, "percent": 34.22, "memory_gb": 6.44, "tags": "render"},
+    {"cores": 8, "percent": 14.55, "memory_gb": 27.27, "tags": "render"},
+    {"cores": 16, "percent": 1.88, "memory_gb": 63.85, "tags": "render"},
+    {"cores": 32, "percent": 0.28, "memory_gb": 109.00, "tags": "midrange|highend"},
+    {"cores": 64, "percent": 0.03, "memory_gb": 233.12, "tags": "highend"},
 ]
 
 # Job priority levels

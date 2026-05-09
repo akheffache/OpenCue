@@ -15,11 +15,12 @@ logger = logging.getLogger(__name__)
 class FrameType:
     """Represents a type of frame with specific resource requirements."""
 
-    def __init__(self, cores: int, memory_gb: float, percent: float):
+    def __init__(self, cores: int, memory_gb: float, percent: float, tags: str = "general"):
         self.cores = cores
         self.memory_gb = memory_gb
         self.memory_kb = int(memory_gb * 1024 * 1024)
         self.percent = percent
+        self.tags = tags  # Pipe-separated tags (e.g., "general" or "midrange|highend")
 
 
 class JobGenerator:
@@ -37,6 +38,7 @@ class JobGenerator:
                 cores=ft["cores"],
                 memory_gb=ft["memory_gb"],
                 percent=ft["percent"],
+                tags=ft.get("tags", "general"),
             )
             for ft in frame_types
         ]
@@ -82,6 +84,7 @@ class JobGenerator:
         <cores>{layer['cores']}</cores>
         <memory>{layer['memory_kb']}</memory>
         <threadable>false</threadable>
+        <tags>{layer['tags']}</tags>
       </layer>"""
             layers_xml.append(layer_xml)
 
@@ -145,6 +148,7 @@ class JobGenerator:
                         "cores": ft.cores,
                         "memory_kb": ft.memory_kb,
                         "frame_count": frames_for_this_job,
+                        "tags": ft.tags,
                     })
 
             if layers:
