@@ -90,6 +90,31 @@ public class RedisSchedulingEventListener {
                   + "return 0",
                     Long.class);
 
+    /**
+     * Atomically replace the contents of layer:{id}:tags with a new tag set.
+     *
+     * Eliminates the race where the previous `delete then add` pair left a
+     * window during which a concurrent dispatcher Lua script saw an empty
+     * tag set and applied "no required tags = layer can run on any host",
+     * briefly letting frames dispatch to hosts that should have been excluded
+     * by the layer's tag restriction.
+     *
+     * Runs as a single EVAL so a reader either observes the old set or the
+     * new set, never a half-built or empty intermediate.
+     *
+     * KEYS[1] = layer:{layerId}:tags
+     * ARGV[1..N] = new normalized tags (may be empty)
+     * Returns: number of tags written
+     */
+    private static final RedisScript<Long> REPLACE_LAYER_TAGS_SCRIPT =
+            new DefaultRedisScript<>(
+                    "redis.call('DEL', KEYS[1]) "
+                  + "if #ARGV > 0 then "
+                  + "  redis.call('SADD', KEYS[1], unpack(ARGV)) "
+                  + "end "
+                  + "return #ARGV",
+                    Long.class);
+
     public RedisSchedulingEventListener(RedisTemplate<String, String> redisTemplate) {
         this.redisTemplate = redisTemplate;
         logger.info("Redis scheduling event listener initialized (frame events only)");
@@ -229,13 +254,15 @@ public class RedisSchedulingEventListener {
 
             redisTemplate.opsForHash().putAll(layerKey, layerData);
 
-            // Store layer tags as SET for efficient matching (no string parsing in Lua)
+            // Store layer tags as SET for efficient matching (no string parsing in Lua).
+            // P1 #12: replace via inline Lua so a concurrent dispatcher never
+            // observes an empty intermediate state. See REPLACE_LAYER_TAGS_SCRIPT.
             String layerTagsKey = layerKey + ":tags";
-            redisTemplate.delete(layerTagsKey); // Clear existing tags
             Set<String> normalizedTags = RedisCacheLoadService.normalizeTags(event.getTags());
-            if (!normalizedTags.isEmpty()) {
-                redisTemplate.opsForSet().add(layerTagsKey, normalizedTags.toArray(new String[0]));
-            }
+            redisTemplate.execute(
+                    REPLACE_LAYER_TAGS_SCRIPT,
+                    Collections.singletonList(layerTagsKey),
+                    normalizedTags.toArray(new Object[0]));
 
             // Store layer limits - CRITICAL for 1-to-1 parity with SQL
             if (event.hasLimits()) {
