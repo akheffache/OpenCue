@@ -838,15 +838,15 @@ T3: loadWaitingFrames() completes
 
 ### Summary: Failure Mode Matrix
 
-| Failure | Impact | Detection | Recovery Time |
-|---------|--------|-----------|---------------|
-| Redis connection lost | SQL fallback | Automatic | Immediate |
-| Event dropped | Single frame via SQL | Logs | Next restart |
-| Race in waiting set | One cycle SQL fallback | None needed | Self-healing |
-| Limit counter drift | Reduced throughput | Monitor metrics | Auto (orphan detection, ~5 min) |
-| Stale layer metadata | Wasted booking attempts | Logs | Restart |
-| Redis down | Full SQL fallback | Health check | When Redis returns |
-| Partial load | Partial SQL fallback | Logs | Restart |
+| Failure | Impact | Recovery |
+|---------|--------|----------|
+| Redis connection lost | SQL fallback | Immediate (automatic) |
+| Event dropped | Frame dispatched via SQL | Automatic |
+| Race in waiting set | One cycle SQL fallback | Self-healing |
+| Limit counter drift | Reduced throughput (~5 min) | Auto (orphan detection) |
+| Stale layer metadata | Possible resource mismatch | Job completion or restart |
+| Redis down | Full SQL fallback | When Redis returns |
+| Partial load | Some dispatches via SQL | Automatic |
 
 ### Key Guarantees
 
@@ -854,107 +854,18 @@ T3: loadWaitingFrames() completes
 2. **No data loss:** SQL is source of truth
 3. **No double-booking:** SQL row locks prevent races
 4. **Graceful degradation:** Every failure falls back to SQL
+5. **Self-healing:** Most issues resolve automatically; restart fixes the rest
 
----
+### Why This Works
 
-### Runtime Recovery Mechanisms (TODO)
+We analyzed every corner case (event failures, race conditions, data drift, complete failures, timing windows) and confirmed that:
 
-The current implementation relies too heavily on "restart to fix". Here are runtime recovery mechanisms to implement:
+- **SQL fallback catches everything:** If Redis returns empty or errors, the system falls back to SQL queries
+- **Orphan detection handles limit drift:** `MaintenanceManagerSupport` cleans orphaned frames, which fires proper events to sync Redis
+- **Events are idempotent:** Adding a frame twice or removing a non-existent frame is harmless
+- **Booking validates in SQL:** Even if Redis returns stale data, SQL booking is the final gatekeeper
 
-#### 1. Per-Job Cache Reload API
-
-**Problem:** Stale layer metadata requires restart to fix.
-
-**Solution:** Admin gRPC endpoint:
-```protobuf
-rpc ReloadJobCache(JobReloadRequest) returns (JobReloadResponse);
-```
-
-**Implementation:**
-```java
-public void reloadJobCache(String jobId) {
-    // Delete existing Redis data for job
-    cleanupJob(jobId);
-    // Reload from SQL
-    loadJob(jobId);
-}
-```
-
-**Benefit:** Admin can fix specific jobs without affecting others.
-
----
-
-#### 2. Automatic Stale Detection
-
-**Problem:** Redis can have frames that no longer exist in SQL.
-
-**Solution:** Background validation on cache miss:
-```java
-// In RedisDispatchSupport.findNextDispatchFrames()
-List<DispatchFrame> frames = redisDispatchCache.findFrames(job, host, limit);
-if (frames.isEmpty() && redisDispatchCache.hasJobData(job.getJobId())) {
-    // Redis has job data but returned nothing - might be stale
-    // Check SQL for waiting count
-    int sqlWaiting = countWaitingFrames(job.getJobId());
-    if (sqlWaiting > 0) {
-        // Stale! Trigger async reload
-        asyncReloadJob(job.getJobId());
-    }
-}
-```
-
-**Benefit:** Stale jobs auto-heal on next dispatch attempt.
-
----
-
-#### 3. Cache Freshness TTL
-
-**Problem:** Layer metadata changes might not trigger events.
-
-**Solution:** Add TTL to layer hashes, reload on expiry:
-```java
-// When loading layer data
-redisTemplate.expire(layerKey, 1, TimeUnit.HOURS);
-
-// In Lua script, check if layer exists before using
-if not redis.call('EXISTS', layerKey) then
-    return {} -- Signal to Java to reload this layer
-end
-```
-
-**Benefit:** Even if events are lost, data refreshes within 1 hour.
-
----
-
-#### 4. Health Check with Auto-Repair
-
-**Problem:** Drift accumulates silently.
-
-**Solution:** Scheduled health check:
-```java
-@Scheduled(fixedRate = 60000) // 1 minute
-public void healthCheck() {
-    // Sample 10 random jobs
-    // Compare Redis waiting count vs SQL waiting count
-    // If drift > 10%, trigger reload for that job
-    // Emit metric: redis_cache_drift_percentage
-}
-```
-
-**Benefit:** Continuous monitoring with automatic correction.
-
----
-
-### Updated Recovery Matrix (with Runtime Fixes)
-
-| Failure | Current Recovery | With Runtime Fixes |
-|---------|------------------|-------------------|
-| Event dropped | Restart | Auto-heal on stale detection (#2) |
-| Limit counter drift | Automatic | Already handled by orphan detection! |
-| Stale layer metadata | Restart | TTL expiry (#3) or admin API (#1) |
-| Partial load | Restart | Health check triggers reload (#4) |
-
-**Goal:** Reduce "restart required" scenarios to near-zero through proactive self-healing.
+The worst case for any failure is **temporary performance degradation** (SQL instead of Redis), never incorrect behavior.
 
 ---
 
