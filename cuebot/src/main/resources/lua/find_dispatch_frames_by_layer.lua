@@ -159,8 +159,20 @@ if noGpu == 0 then
         resourcesMatch = false
     end
 
-    -- GPU memory check: only reject if layer NEEDS GPU memory
-    -- that exceeds what the host has (or host has none)
+    -- GPU memory check.
+    -- Mirrors FIND_DISPATCH_FRAME_BY_LAYER_AND_{HOST,PROC} in
+    -- DispatchQuery.java, which both use:
+    --   layer.int_gpu_mem_min <= ?
+    -- (NOT a BETWEEN, unlike the job-level queries). The expression below is
+    -- equivalent to `minGpuMemory <= hostGpuMemory` for all (host, layer) pairs:
+    --   host=0,layer=0  -> outer false  -> match  (0 <= 0)
+    --   host=0,layer>0  -> inner true   -> reject (>0 <= 0 is false)
+    --   host>0,layer=0  -> outer false  -> match  (0 <= host)
+    --   host>0,layer>0  -> rejected iff layer>host
+    -- IMPORTANT: this is intentionally LOOSER than the job-level script
+    -- (find_dispatch_frames.lua), which implements full BETWEEN semantics
+    -- because its SQL counterparts use BETWEEN. Do NOT "unify" the two scripts
+    -- - they each match their own SQL query. See DispatchQuery.java.
     if minGpuMemory > 0 then
         if hostGpuMemory == 0 or minGpuMemory > hostGpuMemory then
             resourcesMatch = false

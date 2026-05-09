@@ -196,8 +196,17 @@ for _, layerId in ipairs(layerIds) do
                 if minGpus > hostGpus then
                     eligible = false
                 end
-                -- GPU memory check: match SQL's BETWEEN logic exactly
-                -- SQL: layer.int_gpu_mem_min BETWEEN (hostGpuMemory > 0 ? 1 : 0) AND hostGpuMemory
+                -- GPU memory check: match SQL's BETWEEN logic exactly.
+                -- Mirrors FIND_DISPATCH_FRAME_BY_JOB_AND_{HOST,PROC} in
+                -- DispatchQuery.java, which both use:
+                --   layer.int_gpu_mem_min BETWEEN ? AND ?
+                -- with lower bound = (hostGpuMemory > 0 ? 1 : 0) and upper = hostGpuMemory.
+                -- IMPORTANT: this is intentionally STRICTER than the layer-level
+                -- script (find_dispatch_frames_by_layer.lua), which uses <= only
+                -- because its SQL counterparts (FIND_DISPATCH_FRAME_BY_LAYER_AND_*)
+                -- use a plain `<= ?` predicate. Do NOT "unify" the two scripts -
+                -- the SQL layer is the source of truth and they must each match
+                -- their own SQL query. See cuebot/.../DispatchQuery.java.
                 if eligible then
                     if hostGpuMemory > 0 then
                         -- Host has GPU memory: layer must need between 1 and hostGpuMemory
