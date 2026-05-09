@@ -264,11 +264,11 @@ public class RedisSchedulingEventListener {
     private void createFrameMetadata(FrameStateChangedEvent event) {
         String frameKey = FRAME_PREFIX + event.getFrameId();
 
+        // Note: dispatchOrder is now stored on layer, not frame
         Map<String, String> frameData = new HashMap<>();
         frameData.put("layerId", event.getLayerId());
         frameData.put("jobId", event.getJobId());
         frameData.put("state", "WAITING");
-        frameData.put("dispatchOrder", String.valueOf(event.getDispatchOrder()));
         frameData.put("layerOrder", String.valueOf(event.getLayerOrder()));
         // Additional DispatchFrame fields
         frameData.put("name", event.getFrameName() != null ? event.getFrameName() : "");

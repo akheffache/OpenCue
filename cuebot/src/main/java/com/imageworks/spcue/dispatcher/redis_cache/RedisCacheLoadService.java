@@ -359,7 +359,7 @@ public class RedisCacheLoadService {
                      "l.str_cmd, l.str_range, l.int_chunk_size, l.str_services, " +
                      "l.int_cores_min, l.int_cores_max, l.int_mem_min, " +
                      "l.int_gpus_min, l.int_gpus_max, l.int_gpu_mem_min, l.b_threadable, " +
-                     "ls.int_waiting_count " +
+                     "l.int_dispatch_order, ls.int_waiting_count " +
                      "FROM layer l " +
                      "JOIN layer_stat ls ON ls.pk_layer = l.pk_layer " +
                      (jobId == null
@@ -402,6 +402,7 @@ public class RedisCacheLoadService {
                     layerData.put("maxGpus", String.valueOf(row.get("int_gpus_max")));
                     layerData.put("minGpuMemory", String.valueOf(row.get("int_gpu_mem_min")));
                     layerData.put("threadable", String.valueOf(row.get("b_threadable")));
+                    layerData.put("dispatchOrder", String.valueOf(row.get("int_dispatch_order")));
 
                     operations.opsForHash().putAll(layerKey, layerData);
 
@@ -465,7 +466,7 @@ public class RedisCacheLoadService {
      */
     private int loadWaitingFrames(String jobId) {
         String sql = "SELECT f.pk_frame, f.pk_layer, f.pk_job, f.str_name, " +
-                     "f.int_dispatch_order, f.int_layer_order, f.int_retries, f.int_version " +
+                     "f.int_layer_order, f.int_retries, f.int_version " +
                      "FROM frame f " +
                      (jobId == null
                          ? "JOIN job j ON j.pk_job = f.pk_job " +
@@ -490,23 +491,22 @@ public class RedisCacheLoadService {
                     String frameId = (String) row.get("pk_frame");
                     String layerId = (String) row.get("pk_layer");
                     String frameJobId = (String) row.get("pk_job");
-                    int dispatchOrder = ((Number) row.get("int_dispatch_order")).intValue();
                     int layerOrder = ((Number) row.get("int_layer_order")).intValue();
 
-                    // Calculate sort score (same as event listener and SQL ORDER BY)
-                    double sortScore = dispatchOrder + (layerOrder / 1000000.0);
+                    // Sort score is just layerOrder (frame number within layer)
+                    // dispatchOrder is now stored on layer, not frame
+                    double sortScore = layerOrder;
 
                     // Add to waiting frames sorted set
                     String waitingKey = FRAMES_WAITING_PREFIX + layerId;
                     operations.opsForZSet().add(waitingKey, frameId, sortScore);
 
-                    // Store frame metadata
+                    // Store frame metadata (dispatchOrder moved to layer)
                     String frameKey = FRAME_PREFIX + frameId;
                     Map<String, String> frameData = new HashMap<>();
                     frameData.put("layerId", layerId);
                     frameData.put("jobId", frameJobId);
                     frameData.put("state", "WAITING");
-                    frameData.put("dispatchOrder", String.valueOf(dispatchOrder));
                     frameData.put("layerOrder", String.valueOf(layerOrder));
                     frameData.put("name", nullToEmpty(row.get("str_name")));
                     frameData.put("retries", String.valueOf(row.get("int_retries")));

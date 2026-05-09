@@ -4,10 +4,11 @@
   This Lua script mirrors the SQL query FIND_DISPATCH_FRAME_BY_JOB_AND_HOST.
   It atomically finds waiting frames that match host resource requirements.
 
-  SMART RESOURCE TRACKING:
-  Unlike SQL which returns N frames hoping some will fit, this script tracks
-  remaining host resources as frames are selected. It returns ONLY frames that
-  will actually fit, accounting for cumulative resource consumption.
+  OPTIMIZED ALGORITHM:
+  1. Get eligible layers (filtered by tags, resources, limits)
+  2. Sort layers by dispatchOrder (matches SQL ORDER BY)
+  3. Process layers in order, take frames from each until host is full
+  NO giant frame list, NO expensive sorting of all frames.
 
   KEYS:
     KEYS[1] = layers:waiting:{jobId} - Set of layer IDs with waiting frames
@@ -48,9 +49,6 @@ local remainingCores = hostCores
 local remainingMemory = hostMemory
 local remainingGpus = hostGpus
 local remainingGpuMemory = hostGpuMemory
-
--- Max frames to fetch per layer (prevents O(n) memory on huge jobs)
-local MAX_FRAMES_PER_LAYER = 1000
 
 -- Helper function to check if host tags satisfy layer's required tags.
 -- Layer tags are stored as a SET in Redis (layer:{id}:tags).
@@ -127,6 +125,7 @@ for _, layerId in ipairs(layerIds) do
         local minGpus = tonumber(layer['minGpus'] or 0)
         local minGpuMemory = tonumber(layer['minGpuMemory'] or 0)
         local threadable = layer['threadable'] == 'true'
+        local dispatchOrder = tonumber(layer['dispatchOrder'] or 0)
 
         -- Check static requirements (don't depend on remaining resources)
         local eligible = true
@@ -170,6 +169,7 @@ for _, layerId in ipairs(layerIds) do
         if eligible then
             table.insert(eligibleLayers, {
                 layerId = layerId,
+                dispatchOrder = dispatchOrder,
                 minCores = minCores,
                 minMemory = minMemory,
                 minGpus = minGpus,
@@ -183,90 +183,67 @@ if #eligibleLayers == 0 then
     return {}
 end
 
--- Find smallest resource requirements across eligible layers (for early termination)
-local smallestMinCores = math.huge
-local smallestMinMemory = math.huge
-for _, layer in ipairs(eligibleLayers) do
-    if layer.minCores < smallestMinCores then
-        smallestMinCores = layer.minCores
-    end
-    if layer.minMemory < smallestMinMemory then
-        smallestMinMemory = layer.minMemory
-    end
-end
-
--- Collect all candidate frames with their resource requirements
-local candidateFrames = {}
-
-for _, layer in ipairs(eligibleLayers) do
-    local framesWaitingKey = 'frames:waiting:' .. layer.layerId
-    -- Get top N waiting frames for this layer (sorted by dispatch order)
-    local frames = redis.call('ZRANGE', framesWaitingKey, 0, MAX_FRAMES_PER_LAYER - 1, 'WITHSCORES')
-
-    for i = 1, #frames, 2 do
-        local frameId = frames[i]
-        local score = tonumber(frames[i + 1])
-        table.insert(candidateFrames, {
-            frameId = frameId,
-            layerId = layer.layerId,
-            score = score,
-            minCores = layer.minCores,
-            minMemory = layer.minMemory,
-            minGpus = layer.minGpus,
-            minGpuMemory = layer.minGpuMemory
-        })
-    end
-end
-
--- Sort all candidate frames by dispatch order (score)
-table.sort(candidateFrames, function(a, b)
-    return a.score < b.score
+-- Sort layers by dispatchOrder (matches SQL: ORDER BY int_dispatch_order)
+table.sort(eligibleLayers, function(a, b)
+    return a.dispatchOrder < b.dispatchOrder
 end)
 
--- Select frames that fit in REMAINING resources
+-- Process layers in order, take frames from each until host is full
+-- NO giant frame list, NO sorting of frames - much more efficient!
 local result = {}
 
-for _, frame in ipairs(candidateFrames) do
-    -- Check if this frame fits in remaining resources
-    local fits = true
-
-    if frame.minCores > remainingCores then
-        fits = false
-    end
-    if frame.minMemory > remainingMemory then
-        fits = false
+for _, layer in ipairs(eligibleLayers) do
+    -- Skip this layer if it can no longer fit in remaining resources
+    if layer.minCores > remainingCores or layer.minMemory > remainingMemory then
+        goto continue
     end
     if noGpu == 0 then
-        if frame.minGpus > remainingGpus then
-            fits = false
-        end
-        if frame.minGpuMemory > remainingGpuMemory then
-            fits = false
+        if layer.minGpus > remainingGpus or layer.minGpuMemory > remainingGpuMemory then
+            goto continue
         end
     end
 
-    if fits then
-        -- Add frame to result
-        table.insert(result, frame.frameId)
+    -- Calculate how many frames from this layer we can fit
+    local canFitCores = math.floor(remainingCores / layer.minCores)
+    local canFitMemory = math.floor(remainingMemory / layer.minMemory)
+    local canFit = math.min(canFitCores, canFitMemory)
 
-        -- Deduct resources from remaining pool
-        remainingCores = remainingCores - frame.minCores
-        remainingMemory = remainingMemory - frame.minMemory
+    if noGpu == 0 and layer.minGpus > 0 then
+        local canFitGpus = math.floor(remainingGpus / layer.minGpus)
+        canFit = math.min(canFit, canFitGpus)
+    end
+    if noGpu == 0 and layer.minGpuMemory > 0 then
+        local canFitGpuMem = math.floor(remainingGpuMemory / layer.minGpuMemory)
+        canFit = math.min(canFit, canFitGpuMem)
+    end
+
+    -- Don't fetch more frames than we need
+    local needed = math.min(canFit, limit - #result)
+    if needed <= 0 then
+        break  -- We have enough frames
+    end
+
+    -- Get frames from this layer (already sorted by layerOrder in sorted set)
+    local framesWaitingKey = 'frames:waiting:' .. layer.layerId
+    local frames = redis.call('ZRANGE', framesWaitingKey, 0, needed - 1)
+
+    -- Add frames to result and deduct resources
+    for _, frameId in ipairs(frames) do
+        table.insert(result, frameId)
+        remainingCores = remainingCores - layer.minCores
+        remainingMemory = remainingMemory - layer.minMemory
         if noGpu == 0 then
-            remainingGpus = remainingGpus - frame.minGpus
-            remainingGpuMemory = remainingGpuMemory - frame.minGpuMemory
-        end
-
-        -- Stop if we have enough frames
-        if #result >= limit then
-            break
-        end
-
-        -- Stop if remaining resources are too low for any more frames
-        if remainingCores < smallestMinCores or remainingMemory < smallestMinMemory then
-            break
+            remainingGpus = remainingGpus - layer.minGpus
+            remainingGpuMemory = remainingGpuMemory - layer.minGpuMemory
         end
     end
+
+    -- Stop if we have enough frames
+    if #result >= limit then
+        break
+    end
+
+    ::continue::
 end
 
 return result

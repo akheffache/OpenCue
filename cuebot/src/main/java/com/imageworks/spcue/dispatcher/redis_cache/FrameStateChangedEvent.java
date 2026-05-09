@@ -93,11 +93,11 @@ public class FrameStateChangedEvent {
 
     /**
      * Calculate the sort score for Redis sorted set.
-     * Combines dispatch order and layer order for proper frame ordering.
+     * Just layerOrder - dispatchOrder is now stored on layer, not frame.
+     * Frames within a layer are sorted by their frame number (layerOrder).
      */
     public double getSortScore() {
-        // dispatchOrder is primary, layerOrder is secondary
-        // Using decimal to encode both: dispatchOrder.layerOrder
-        return dispatchOrder + (layerOrder / 1000000.0);
+        // Just layerOrder - dispatchOrder is stored on layer instead
+        return layerOrder;
     }
 }
