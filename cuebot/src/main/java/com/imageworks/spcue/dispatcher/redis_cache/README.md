@@ -849,8 +849,125 @@ T3: loadWaitingFrames() completes
 2. **No data loss:** SQL is source of truth
 3. **No double-booking:** SQL row locks prevent races
 4. **Graceful degradation:** Every failure falls back to SQL
-5. **Self-healing:** Restart always fixes desync
-6. **No manual intervention required:** All recovery is automatic
+
+---
+
+### Runtime Recovery Mechanisms (TODO)
+
+The current implementation relies too heavily on "restart to fix". Here are runtime recovery mechanisms to implement:
+
+#### 1. Periodic Limit Counter Resync
+
+**Problem:** Limit counters can drift due to orphaned frames or missed events.
+
+**Solution:** Scheduled task every 5 minutes:
+```java
+@Scheduled(fixedRate = 300000) // 5 minutes
+public void resyncLimitCounters() {
+    // Query SQL: SELECT limit_id, SUM(int_running_count) FROM layer_stat GROUP BY limit_id
+    // Compare with Redis: GET limit:{id}:running
+    // Fix any drift
+}
+```
+
+**Benefit:** Limit drift self-corrects within 5 minutes, no restart needed.
+
+---
+
+#### 2. Per-Job Cache Reload API
+
+**Problem:** Stale layer metadata requires restart to fix.
+
+**Solution:** Admin gRPC endpoint:
+```protobuf
+rpc ReloadJobCache(JobReloadRequest) returns (JobReloadResponse);
+```
+
+**Implementation:**
+```java
+public void reloadJobCache(String jobId) {
+    // Delete existing Redis data for job
+    cleanupJob(jobId);
+    // Reload from SQL
+    loadJob(jobId);
+}
+```
+
+**Benefit:** Admin can fix specific jobs without affecting others.
+
+---
+
+#### 3. Automatic Stale Detection
+
+**Problem:** Redis can have frames that no longer exist in SQL.
+
+**Solution:** Background validation on cache miss:
+```java
+// In RedisDispatchSupport.findNextDispatchFrames()
+List<DispatchFrame> frames = redisDispatchCache.findFrames(job, host, limit);
+if (frames.isEmpty() && redisDispatchCache.hasJobData(job.getJobId())) {
+    // Redis has job data but returned nothing - might be stale
+    // Check SQL for waiting count
+    int sqlWaiting = countWaitingFrames(job.getJobId());
+    if (sqlWaiting > 0) {
+        // Stale! Trigger async reload
+        asyncReloadJob(job.getJobId());
+    }
+}
+```
+
+**Benefit:** Stale jobs auto-heal on next dispatch attempt.
+
+---
+
+#### 4. Cache Freshness TTL
+
+**Problem:** Layer metadata changes might not trigger events.
+
+**Solution:** Add TTL to layer hashes, reload on expiry:
+```java
+// When loading layer data
+redisTemplate.expire(layerKey, 1, TimeUnit.HOURS);
+
+// In Lua script, check if layer exists before using
+if not redis.call('EXISTS', layerKey) then
+    return {} -- Signal to Java to reload this layer
+end
+```
+
+**Benefit:** Even if events are lost, data refreshes within 1 hour.
+
+---
+
+#### 5. Health Check with Auto-Repair
+
+**Problem:** Drift accumulates silently.
+
+**Solution:** Scheduled health check:
+```java
+@Scheduled(fixedRate = 60000) // 1 minute
+public void healthCheck() {
+    // Sample 10 random jobs
+    // Compare Redis waiting count vs SQL waiting count
+    // If drift > 10%, trigger reload for that job
+    // Emit metric: redis_cache_drift_percentage
+}
+```
+
+**Benefit:** Continuous monitoring with automatic correction.
+
+---
+
+### Updated Recovery Matrix (with Runtime Fixes)
+
+| Failure | Current Recovery | With Runtime Fixes |
+|---------|------------------|-------------------|
+| Event dropped | Restart | Auto-heal on stale detection (#3) |
+| Limit counter drift | Restart | Periodic resync (#1) |
+| Stale layer metadata | Restart | TTL expiry (#4) or admin API (#2) |
+| Partial load | Restart | Health check triggers reload (#5) |
+
+**Goal:** Reduce "restart required" scenarios to near-zero through proactive self-healing.
 
 ---
 
