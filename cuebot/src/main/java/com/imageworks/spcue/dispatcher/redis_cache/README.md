@@ -727,14 +727,16 @@ SQL: layer.int_cores_min = 8
 Redis: layer:abc123 → {minCores: 4}  (stale)
 ```
 
-**Impact:** Redis might return frames that don't fit host.
+**Impact:** Frame runs with stale resource requirements (4 cores instead of 8).
 
 **Recovery:**
-- SQL booking validates resources again
-- Frame booking fails if host doesn't have 8 cores
-- Admin can restart cuebot or wait for job completion
+- Frame may be slow or fail due to insufficient resources
+- Job eventually completes, stale data cleaned up
+- Admin can restart cuebot to force reload
 
-**Worst case:** Wasted dispatch attempts until restart.
+**Why this is rare:** Layer changes mid-job are uncommon. Most jobs run with original settings.
+
+**Worst case:** Some frames run with wrong resources until job completes or restart.
 
 ---
 
