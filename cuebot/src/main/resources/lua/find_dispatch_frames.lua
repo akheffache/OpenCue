@@ -156,11 +156,19 @@ for _, layerId in ipairs(layerIds) do
                 if minGpus > hostGpus then
                     eligible = false
                 end
-                -- GPU memory check: only reject if layer NEEDS GPU memory
-                -- that exceeds what the host has (or host has none)
-                if minGpuMemory > 0 then
-                    if hostGpuMemory == 0 or minGpuMemory > hostGpuMemory then
-                        eligible = false
+                -- GPU memory check: match SQL's BETWEEN logic exactly
+                -- SQL: layer.int_gpu_mem_min BETWEEN (hostGpuMemory > 0 ? 1 : 0) AND hostGpuMemory
+                if eligible then
+                    if hostGpuMemory > 0 then
+                        -- Host has GPU memory: layer must need between 1 and hostGpuMemory
+                        if minGpuMemory < 1 or minGpuMemory > hostGpuMemory then
+                            eligible = false
+                        end
+                    else
+                        -- Host has NO GPU memory: layer must need exactly 0
+                        if minGpuMemory ~= 0 then
+                            eligible = false
+                        end
                     end
                 end
             end
@@ -204,8 +212,9 @@ for _, layer in ipairs(eligibleLayers) do
     end
 
     -- Calculate how many frames from this layer we can fit
-    local canFitCores = math.floor(remainingCores / layer.minCores)
-    local canFitMemory = math.floor(remainingMemory / layer.minMemory)
+    -- Guard against division by zero (layers with 0 requirements can fit unlimited frames)
+    local canFitCores = layer.minCores > 0 and math.floor(remainingCores / layer.minCores) or limit
+    local canFitMemory = layer.minMemory > 0 and math.floor(remainingMemory / layer.minMemory) or limit
     local canFit = math.min(canFitCores, canFitMemory)
 
     if noGpu == 0 and layer.minGpus > 0 then
