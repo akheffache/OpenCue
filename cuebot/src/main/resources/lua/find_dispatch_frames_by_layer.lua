@@ -58,7 +58,7 @@ end
 -- Helper function to check if host tags satisfy layer's required tags.
 -- Layer tags are stored as a SET in Redis (layer:{id}:tags).
 -- Host tags are passed as pre-normalized values from Java.
--- Returns true if ALL layer required tags are present in hostTagSet.
+-- Returns true if host has at least ONE of the required tags (OR logic).
 local function tagsMatch(layerTagsKey, hostTagSet)
     local requiredTags = redis.call('SMEMBERS', layerTagsKey)
 
@@ -67,13 +67,13 @@ local function tagsMatch(layerTagsKey, hostTagSet)
         return true
     end
 
-    -- Check all required tags are in host's tag set
+    -- OR logic: host needs at least ONE of the required tags
     for _, reqTag in ipairs(requiredTags) do
-        if not hostTagSet[reqTag] then
-            return false
+        if hostTagSet[reqTag] then
+            return true  -- Found a match!
         end
     end
-    return true
+    return false  -- No matching tag found
 end
 
 -- Helper function to check if layer limits allow dispatch
