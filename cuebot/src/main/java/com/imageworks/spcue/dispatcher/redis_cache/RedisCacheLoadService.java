@@ -31,6 +31,7 @@ import javax.annotation.PostConstruct;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.core.RedisOperations;
@@ -41,7 +42,6 @@ import org.springframework.stereotype.Service;
 
 import com.imageworks.spcue.JobDetail;
 import com.imageworks.spcue.dao.JobDao;
-import com.imageworks.spcue.grpc.job.FrameState;
 
 /**
  * Populates Redis cache from SQL on application startup.
@@ -79,6 +79,15 @@ public class RedisCacheLoadService {
     // Unique instance ID for lock ownership
     private final String instanceId = UUID.randomUUID().toString();
 
+    /**
+     * If true, flush Redis before loading. Use with caution - only when you are
+     * certain no other cuebots are running and maintaining the cache.
+     *
+     * Set via: --redis.flush-on-startup=true or -Dredis.flush-on-startup=true
+     */
+    @Value("${redis.flush-on-startup:false}")
+    private boolean flushOnStartup;
+
     @Autowired
     public RedisCacheLoadService(RedisTemplate<String, String> redisTemplate,
                                     JdbcTemplate jdbcTemplate,
@@ -95,6 +104,11 @@ public class RedisCacheLoadService {
      * Uses a distributed lock to prevent concurrent load from multiple cuebots.
      * If another instance is already loading, this instance skips load
      * (the other instance will populate Redis, and we have SQL fallback).
+     *
+     * Behavior:
+     * - Default: Load from SQL, overwriting any existing data (safe for multi-cuebot)
+     * - With --redis.flush-on-startup=true: Flush Redis first, then load (use only when
+     *   you're certain no other cuebots are running)
      */
     @PostConstruct
     public void init() {
@@ -106,6 +120,14 @@ public class RedisCacheLoadService {
         if (Boolean.TRUE.equals(acquired)) {
             logger.info("Load lock acquired, starting Redis cache load...");
             try {
+                if (flushOnStartup) {
+                    logger.warn("--redis.flush-on-startup is set - FLUSHING Redis before load. " +
+                               "Ensure no other cuebots are running!");
+                    redisTemplate.execute(connection -> {
+                        connection.serverCommands().flushDb();
+                        return null;
+                    });
+                }
                 loadCache();
             } finally {
                 // Only release if we still own the lock (could have expired)
@@ -125,28 +147,21 @@ public class RedisCacheLoadService {
     /**
      * Main load method - populates Redis from SQL.
      *
-     * IMPORTANT: We only load if Redis is empty. If Redis already has data,
-     * we assume another cuebot is running and maintaining it via events.
-     * Wiping existing data would disrupt other running cuebots!
+     * This always loads data from SQL, overwriting any existing Redis data.
+     * This is safe for multi-cuebot scenarios because:
+     * - SQL is the source of truth
+     * - All cuebots load the same data
+     * - Events keep everything in sync after load
+     *
+     * Note: Orphan keys from deleted jobs may accumulate over time. Use
+     * --redis.flush-on-startup=true periodically (when only one cuebot is running)
+     * to clean them up.
      */
     public void loadCache() {
         long startTime = System.currentTimeMillis();
-
-        // Check if Redis already has scheduling data
-        Long existingKeyCount = redisTemplate.execute(connection ->
-                connection.serverCommands().dbSize());
-
-        if (existingKeyCount != null && existingKeyCount > 0) {
-            logger.info("Redis already has {} keys - skipping load to preserve data from other cuebots. " +
-                       "Events from this cuebot will keep data in sync.", existingKeyCount);
-            return;
-        }
-
-        logger.info("Redis is empty, starting cache load from SQL...");
+        logger.info("Starting cache load from SQL...");
 
         try {
-            // No need to clear - Redis is already empty
-
             // Populate limits first (they're referenced by layers)
             int limitCount = loadLimits();
 
