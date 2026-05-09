@@ -63,6 +63,10 @@ import com.imageworks.spcue.util.CueUtil;
 import com.imageworks.spcue.util.FrameSet;
 import com.imageworks.spcue.util.JobLogUtil;
 import com.imageworks.spcue.util.Convert;
+import com.imageworks.spcue.dao.SchedulingEventPublisher;
+import com.imageworks.spcue.dispatcher.redis_cache.RedisCacheWarmupService;
+
+import org.springframework.beans.factory.annotation.Autowired;
 
 @Transactional
 public class JobManagerService implements JobManager {
@@ -80,6 +84,33 @@ public class JobManagerService implements JobManager {
     private GroupDao groupDao;
     private FacilityDao facilityDao;
     private JobLogUtil jobLogUtil;
+    private SchedulingEventPublisher schedulingEventPublisher;
+    private RedisCacheWarmupService redisCacheWarmupService;
+
+    /**
+     * Set the scheduling event publisher for Redis cache synchronization.
+     * Autowired with required=false so it works whether Redis is enabled or not.
+     */
+    @Autowired(required = false)
+    public void setSchedulingEventPublisher(SchedulingEventPublisher schedulingEventPublisher) {
+        this.schedulingEventPublisher = schedulingEventPublisher;
+        if (schedulingEventPublisher != null) {
+            logger.info("Scheduling event publisher configured in JobManagerService: {}",
+                    schedulingEventPublisher.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Set the Redis cache warmup service for populating new job data.
+     * Autowired with required=false so it works whether Redis is enabled or not.
+     */
+    @Autowired(required = false)
+    public void setRedisCacheWarmupService(RedisCacheWarmupService redisCacheWarmupService) {
+        this.redisCacheWarmupService = redisCacheWarmupService;
+        if (redisCacheWarmupService != null) {
+            logger.info("Redis cache warmup service configured in JobManagerService");
+        }
+    }
 
     @Transactional(propagation = Propagation.REQUIRED, readOnly = true)
     public boolean isJobComplete(JobInterface job) {
@@ -163,6 +194,8 @@ public class JobManagerService implements JobManager {
     @Transactional(propagation = Propagation.REQUIRED)
     public void setJobPaused(JobInterface job, boolean paused) {
         jobDao.updatePaused(job, paused);
+        // Note: Job pause state is not tracked in Redis.
+        // Job finding queries use SQL which handles pause filtering.
     }
 
     @Transactional(propagation = Propagation.REQUIRED)
@@ -194,6 +227,16 @@ public class JobManagerService implements JobManager {
 
         for (BuildableJob job : spec.getJobs()) {
             jobDao.activateJob(job.detail, JobState.PENDING);
+            job.detail.state = JobState.PENDING;
+            // Warm up Redis cache with layers and frames for this job
+            // (Job finding uses SQL, but frame dispatch uses Redis)
+            if (redisCacheWarmupService != null) {
+                try {
+                    redisCacheWarmupService.warmupJob(job.detail.id);
+                } catch (Exception e) {
+                    logger.warn("Failed to warm up Redis cache for job: {}", job.detail.id, e);
+                }
+            }
             if (job.getPostJob() != null) {
                 jobDao.activateJob(job.getPostJob().detail, JobState.POSTED);
             }
@@ -320,6 +363,15 @@ public class JobManagerService implements JobManager {
             logger.info("shutting down job: " + job.getName());
             jobDao.activatePostJob(job);
             logger.info("activating post jobs");
+            // Publish job completion for Redis cache cleanup
+            if (schedulingEventPublisher != null) {
+                try {
+                    schedulingEventPublisher.publishJobCompleted(
+                            job.getJobId(), job.getShowId(), job.getFacilityId());
+                } catch (Exception e) {
+                    logger.warn("Failed to publish job completion for Redis: {}", job.getJobId(), e);
+                }
+            }
             return true;
         }
         return false;

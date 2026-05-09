@@ -21,12 +21,14 @@ import java.util.Set;
 
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.LogManager;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.DataRetrievalFailureException;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.imageworks.spcue.BuildableDependency;
+import com.imageworks.spcue.FrameDetail;
 import com.imageworks.spcue.DependencyManagerException;
 import com.imageworks.spcue.FrameDetail;
 import com.imageworks.spcue.FrameInterface;
@@ -53,6 +55,7 @@ import com.imageworks.spcue.depend.LayerOnJob;
 import com.imageworks.spcue.depend.LayerOnLayer;
 import com.imageworks.spcue.depend.LayerOnSimFrame;
 import com.imageworks.spcue.depend.PreviousFrame;
+import com.imageworks.spcue.dao.SchedulingEventPublisher;
 import com.imageworks.spcue.grpc.depend.DependTarget;
 import com.imageworks.spcue.grpc.depend.DependType;
 import com.imageworks.spcue.grpc.job.FrameState;
@@ -75,6 +78,12 @@ public class DependManagerService implements DependManager {
     private FrameSearchFactory frameSearchFactory;
     private KafkaEventPublisher kafkaEventPublisher;
     private MonitoringEventBuilder monitoringEventBuilder;
+    private SchedulingEventPublisher schedulingEventPublisher;
+
+    @Autowired(required = false)
+    public void setSchedulingEventPublisher(SchedulingEventPublisher schedulingEventPublisher) {
+        this.schedulingEventPublisher = schedulingEventPublisher;
+    }
 
     /** Job Depends **/
     @Override
@@ -514,7 +523,17 @@ public class DependManagerService implements DependManager {
         if (dependDao.setInactive(depend)) {
             logger.info("satisfied depend: " + depend.getId());
             for (FrameInterface f : frameDao.getDependentFrames(depend)) {
-                if (!dependDao.decrementDependCount(f)) {
+                if (dependDao.decrementDependCount(f)) {
+                    // Check if the database trigger changed the frame to WAITING
+                    // (happens when depend_count goes from 1 to 0)
+                    if (schedulingEventPublisher != null) {
+                        FrameDetail updatedFrame = frameDao.getFrameDetail(f.getFrameId());
+                        if (updatedFrame.state == FrameState.WAITING) {
+                            schedulingEventPublisher.publishFrameStateChanged(
+                                    updatedFrame, FrameState.DEPEND, FrameState.WAITING);
+                        }
+                    }
+                } else {
                     logger.warn(
                             "warning, depend count for " + depend.getId() + "was not decremented "
                                     + "for frame " + f + "because the count is " + "already 0.");

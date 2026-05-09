@@ -64,6 +64,10 @@ dependencies {
     implementation group: 'org.elasticsearch.client', name: 'elasticsearch-rest-client', version: "${elasticsearchVersion}"
     implementation group: 'jakarta.json', name: 'jakarta.json-api', version: '2.1.1'
 
+    // Redis for scheduling cache/index
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-data-redis'
+    implementation group: 'org.apache.commons', name: 'commons-pool2', version: '2.11.1'
+
     protobuf files("../proto/src/")
 
     testImplementation group: 'junit', name: 'junit', version: '4.12'

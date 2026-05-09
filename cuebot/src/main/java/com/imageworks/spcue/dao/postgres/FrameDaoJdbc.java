@@ -52,8 +52,35 @@ import com.imageworks.spcue.grpc.job.LayerType;
 import com.imageworks.spcue.util.CueUtil;
 import com.imageworks.spcue.util.FrameSet;
 import com.imageworks.spcue.util.SqlUtil;
+import com.imageworks.spcue.dao.SchedulingEventPublisher;
+
+import org.springframework.beans.factory.annotation.Autowired;
 
 public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
+
+    private static final org.apache.logging.log4j.Logger logger =
+            org.apache.logging.log4j.LogManager.getLogger(FrameDaoJdbc.class);
+
+    private SchedulingEventPublisher schedulingEventPublisher;
+
+    /**
+     * Set the scheduling event publisher for Redis cache synchronization.
+     * Autowired with required=false so it works whether Redis is enabled or not.
+     */
+    @Autowired(required = false)
+    public void setSchedulingEventPublisher(SchedulingEventPublisher schedulingEventPublisher) {
+        this.schedulingEventPublisher = schedulingEventPublisher;
+        if (schedulingEventPublisher != null) {
+            logger.info("Scheduling event publisher configured: {}",
+                    schedulingEventPublisher.getClass().getSimpleName());
+        }
+    }
+
+    private void publishFrameStateChange(FrameInterface frame, FrameState from, FrameState to) {
+        if (schedulingEventPublisher != null) {
+            schedulingEventPublisher.publishFrameStateChanged(frame, from, to);
+        }
+    }
 
     private static final String UPDATE_FRAME_STOPPED_NORSS = "UPDATE " + "frame " + "SET "
             + "str_state=?, " + "int_exit_status = ?, " + "ts_stopped = current_timestamp, "
@@ -67,8 +94,13 @@ public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
 
     @Override
     public boolean updateFrameStopped(FrameInterface frame, FrameState state, int exitStatus) {
-        return getJdbcTemplate().update(UPDATE_FRAME_STOPPED_NORSS, state.toString(), exitStatus,
-                frame.getFrameId(), FrameState.RUNNING.toString(), frame.getVersion()) == 1;
+        boolean updated = getJdbcTemplate().update(UPDATE_FRAME_STOPPED_NORSS, state.toString(),
+                exitStatus, frame.getFrameId(), FrameState.RUNNING.toString(),
+                frame.getVersion()) == 1;
+        if (updated) {
+            publishFrameStateChange(frame, FrameState.RUNNING, state);
+        }
+        return updated;
     }
 
     private static final String UPDATE_FRAME_STOPPED = "UPDATE " + "frame " + "SET "
@@ -86,9 +118,13 @@ public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
     @Override
     public boolean updateFrameStopped(FrameInterface frame, FrameState state, int exitStatus,
             long maxRss) {
-
-        return getJdbcTemplate().update(UPDATE_FRAME_STOPPED, state.toString(), exitStatus, maxRss,
-                frame.getFrameId(), FrameState.RUNNING.toString(), frame.getVersion()) == 1;
+        boolean updated = getJdbcTemplate().update(UPDATE_FRAME_STOPPED, state.toString(),
+                exitStatus, maxRss, frame.getFrameId(), FrameState.RUNNING.toString(),
+                frame.getVersion()) == 1;
+        if (updated) {
+            publishFrameStateChange(frame, FrameState.RUNNING, state);
+        }
+        return updated;
     }
 
     private static final String UPDATE_FRAME_REASON = "UPDATE " + "frame " + "SET "
@@ -183,6 +219,9 @@ public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
         } catch (DataAccessException e) {
             throw new FrameReservationException(e.getCause());
         }
+
+        // Publish state change for Redis cache sync
+        publishFrameStateChange(frame, FrameState.WAITING, FrameState.RUNNING);
     }
 
     private static final String UPDATE_FRAME_FIXED =
@@ -488,6 +527,8 @@ public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
         if (getJdbcTemplate().update(UPDATE_FRAME_STATE, state.toString(), frame.getFrameId(),
                 frame.getVersion()) == 1) {
             logger.info("The frame " + frame + " state changed to " + state.toString());
+            // Note: previous state unknown here, using null
+            publishFrameStateChange(frame, null, state);
             return true;
         }
         logger.info("Failed to change the frame " + frame + " state to " + state.toString());
@@ -501,8 +542,11 @@ public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
 
     @Override
     public void markFrameAsWaiting(FrameInterface frame) {
-        getJdbcTemplate().update(MARK_AS_WAITING, FrameState.WAITING.toString(), frame.getFrameId(),
-                frame.getVersion(), FrameState.DEPEND.toString());
+        int updated = getJdbcTemplate().update(MARK_AS_WAITING, FrameState.WAITING.toString(),
+                frame.getFrameId(), frame.getVersion(), FrameState.DEPEND.toString());
+        if (updated > 0) {
+            publishFrameStateChange(frame, FrameState.DEPEND, FrameState.WAITING);
+        }
     }
 
     private static final String MARK_AS_DEPEND = "UPDATE " + "frame " + "SET " + "str_state=?, "
@@ -523,8 +567,12 @@ public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
                 frame.getJobId(), frame.getLayerId(), frame.getFrameId());
 
         if (depend_count > 0) {
-            getJdbcTemplate().update(MARK_AS_DEPEND, FrameState.DEPEND.toString(), depend_count,
-                    frame.getFrameId(), frame.getVersion(), FrameState.WAITING.toString());
+            int updated = getJdbcTemplate().update(MARK_AS_DEPEND, FrameState.DEPEND.toString(),
+                    depend_count, frame.getFrameId(), frame.getVersion(),
+                    FrameState.WAITING.toString());
+            if (updated > 0) {
+                publishFrameStateChange(frame, FrameState.WAITING, FrameState.DEPEND);
+            }
         }
     }
 
