@@ -124,14 +124,28 @@ public class RedisCacheLoadService {
 
     /**
      * Main load method - populates Redis from SQL.
+     *
+     * IMPORTANT: We only load if Redis is empty. If Redis already has data,
+     * we assume another cuebot is running and maintaining it via events.
+     * Wiping existing data would disrupt other running cuebots!
      */
     public void loadCache() {
         long startTime = System.currentTimeMillis();
-        logger.info("Starting Redis cache load from SQL...");
+
+        // Check if Redis already has scheduling data
+        Long existingKeyCount = redisTemplate.execute(connection ->
+                connection.serverCommands().dbSize());
+
+        if (existingKeyCount != null && existingKeyCount > 0) {
+            logger.info("Redis already has {} keys - skipping load to preserve data from other cuebots. " +
+                       "Events from this cuebot will keep data in sync.", existingKeyCount);
+            return;
+        }
+
+        logger.info("Redis is empty, starting cache load from SQL...");
 
         try {
-            // Clear existing scheduling data (in case of stale data)
-            clearSchedulingData();
+            // No need to clear - Redis is already empty
 
             // Populate limits first (they're referenced by layers)
             int limitCount = loadLimits();
@@ -157,40 +171,27 @@ public class RedisCacheLoadService {
     }
 
     /**
-     * Clear existing scheduling data from Redis.
-     * Uses SCAN to find and delete keys without blocking Redis for too long.
+     * Force clear all scheduling data from Redis using FLUSHDB.
+     *
+     * WARNING: This should ONLY be used for manual admin operations when you are
+     * certain no other cuebots are running. NEVER call this automatically at startup
+     * as it would wipe data being actively used by other cuebot instances.
+     *
+     * After calling this, you should call loadCache() to repopulate from SQL.
      */
-    private void clearSchedulingData() {
-        logger.info("Clearing existing scheduling data from Redis...");
+    public void forceFlushAndReload() {
+        logger.warn("FORCE FLUSHING Redis - ensure no other cuebots are running!");
 
-        String[] patterns = {
-            "frame:*",
-            "layer:*",
-            "job:*",
-            "frames:waiting:*",
-            "layers:waiting:*",
-            "limit:*"
-        };
+        // FLUSHDB is atomic and efficient - better than KEYS pattern matching
+        redisTemplate.execute(connection -> {
+            connection.serverCommands().flushDb();
+            return null;
+        });
 
-        int totalDeleted = 0;
-        for (String pattern : patterns) {
-            Set<String> keysToDelete = new HashSet<>();
+        logger.info("Redis flushed, reloading from SQL...");
 
-            // Use SCAN via keys() - Spring Data Redis handles cursor internally
-            // Note: For very large datasets, consider using scan() with ScanOptions
-            var keys = redisTemplate.keys(pattern);
-            if (keys != null) {
-                keysToDelete.addAll(keys);
-            }
-
-            if (!keysToDelete.isEmpty()) {
-                redisTemplate.delete(keysToDelete);
-                totalDeleted += keysToDelete.size();
-                logger.debug("Deleted {} keys matching pattern {}", keysToDelete.size(), pattern);
-            }
-        }
-
-        logger.info("Cleared {} existing scheduling keys from Redis", totalDeleted);
+        // Now load fresh data (Redis is empty so loadCache() will proceed)
+        loadCache();
     }
 
     /**
