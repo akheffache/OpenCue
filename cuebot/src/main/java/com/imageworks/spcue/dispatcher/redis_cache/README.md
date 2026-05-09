@@ -341,6 +341,201 @@ Total: O(L × (1 + T + Li + log F))
 4. **Memory-only**: ~100ns access vs ~1ms disk
 5. **Smart filtering**: Only return frames that fit
 
+## Algorithm Deep Dive: SQL vs Lua Scheduling
+
+This section provides a detailed comparison of the SQL and Lua scheduling algorithms, including code snippets and complexity analysis.
+
+### SQL Query: `FIND_DISPATCH_FRAME_BY_JOB_AND_HOST`
+
+The SQL query finds dispatchable frames by joining tables and sorting results:
+
+```sql
+SELECT frame.*, layer.*, job.*
+FROM (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY
+            frame.int_dispatch_order ASC,
+            frame.int_layer_order ASC
+        ) AS LINENUM,
+        ...
+    FROM job, frame, layer
+    WHERE
+        frame.pk_layer = layer.pk_layer
+        AND layer.pk_job = job.pk_job
+        AND layer.int_cores_min <= ?          -- host cores
+        AND layer.int_mem_min <= ?            -- host memory
+        AND (CASE WHEN layer.b_threadable = true THEN 1 ELSE 0 END) >= ?
+        AND layer.int_gpus_min <= ?           -- host GPUs
+        AND layer.int_gpu_mem_min BETWEEN ? AND ?  -- GPU memory range
+        AND frame.str_state = 'WAITING'
+        AND job.pk_job = ?
+        AND layer.pk_layer IN (
+            -- Tag matching subquery
+            SELECT l.pk_layer FROM layer l
+            JOIN host h ON (h.str_tags ~* ('(?x)' || l.str_tags || '\\y')
+                           AND h.str_name = ?)
+            -- Limit checking subquery
+            LEFT JOIN layer_limit ON layer_limit.pk_layer = l.pk_layer
+            LEFT JOIN limit_record ON ...
+            LEFT JOIN (
+                SELECT limit_record.pk_limit_record,
+                       SUM(layer_stat.int_running_count) AS int_sum_running
+                FROM layer_limit
+                LEFT JOIN limit_record ON ...
+                LEFT JOIN layer_stat ON ...
+                GROUP BY limit_record.pk_limit_record
+            ) AS sum_running ON ...
+            WHERE sum_running.int_sum_running < limit_record.int_max_value
+               OR sum_running.int_sum_running IS NULL
+        )
+) AS t1 WHERE LINENUM <= ?  -- limit
+```
+
+**Key characteristics:**
+- Joins 3 tables (job, layer, frame)
+- Subquery for tag matching with regex
+- Subquery for limit checking with GROUP BY aggregation
+- `ROW_NUMBER() OVER (ORDER BY ...)` sorts ALL matching frames
+- Returns top N after sorting
+
+### Lua Script: `find_dispatch_frames.lua`
+
+The Lua script uses pre-sorted data structures and processes layers in order:
+
+```lua
+-- Phase 1: Get layers with waiting frames
+local layerIds = redis.call('SMEMBERS', layersWaitingKey)  -- O(L)
+
+-- Phase 2: Filter eligible layers
+local eligibleLayers = {}
+for _, layerId in ipairs(layerIds) do
+    local layerData = redis.call('HGETALL', 'layer:' .. layerId)  -- O(1)
+
+    -- Check resources
+    if minCores <= hostCores and minMemory <= hostMemory then
+        -- Check tags (SET membership)
+        local requiredTags = redis.call('SMEMBERS', 'layer:' .. layerId .. ':tags')
+
+        -- Check limits (atomic counters)
+        local limitIds = redis.call('SMEMBERS', 'layer:limits:' .. layerId)
+        for _, limitId in ipairs(limitIds) do
+            local maxValue = redis.call('HGET', 'limit:' .. limitId, 'maxValue')
+            local running = redis.call('GET', 'limit:' .. limitId .. ':running')
+            -- Compare running vs max
+        end
+
+        table.insert(eligibleLayers, {layerId, dispatchOrder, ...})
+    end
+end
+
+-- Phase 3: Sort layers (NOT frames!) by dispatchOrder
+table.sort(eligibleLayers, function(a, b)
+    return a.dispatchOrder < b.dispatchOrder
+end)  -- O(L log L)
+
+-- Phase 4: Get frames from each layer (already sorted in ZSET)
+local result = {}
+for _, layer in ipairs(eligibleLayers) do
+    -- Calculate how many frames fit in remaining resources
+    local canFit = math.min(
+        math.floor(remainingCores / layer.minCores),
+        math.floor(remainingMemory / layer.minMemory)
+    )
+
+    -- Frames are PRE-SORTED by layerOrder in the sorted set!
+    local frames = redis.call('ZRANGE',
+        'frames:waiting:' .. layer.layerId, 0, canFit - 1)  -- O(log F + K)
+
+    for _, frameId in ipairs(frames) do
+        table.insert(result, frameId)
+        remainingCores = remainingCores - layer.minCores
+        remainingMemory = remainingMemory - layer.minMemory
+    end
+end
+
+return result
+```
+
+### Complexity Comparison
+
+| Operation | SQL | Lua | Notes |
+|-----------|-----|-----|-------|
+| Get candidate frames | O(F) scan | O(L) layers only | Lua never scans all frames |
+| Join tables | O(F × 3) | O(1) denormalized | Data pre-joined in hashes |
+| Tag matching | O(F × T) regex per frame | O(L × T) per layer | Layers, not frames |
+| Limit checking | O(L × M) with GROUP BY | O(L × M) counter reads | Same but faster reads |
+| **Sorting** | **O(F log F)** all frames | **O(L log L)** layers only | **Key difference!** |
+| Get top K results | O(K) | O(log F + K) ZRANGE | Sorted set traversal |
+
+**Total complexity:**
+- **SQL:** O(F log F + F × T + L × M)
+- **Lua:** O(L log L + L × (T + M) + Σ log F_l)
+
+Where:
+- F = total waiting frames in job
+- L = layers in job
+- T = tag complexity
+- M = limits per layer
+- F_l = frames per layer
+
+### Why Lua Avoids Sorting All Frames
+
+The key insight: **frames are pre-sorted at insert time**.
+
+**When a frame is inserted into Redis:**
+```java
+// Score is layerOrder - frames are sorted as they're added
+// O(log N) per insert
+redisTemplate.opsForZSet().add(waitingKey, frameId, layerOrder);
+```
+
+**When frames are fetched:**
+```lua
+-- ZRANGE returns frames already sorted by score (layerOrder)
+-- O(log N + K) where K = number of frames returned
+local frames = redis.call('ZRANGE', framesWaitingKey, 0, needed - 1)
+```
+
+**Sorting cost comparison:**
+
+| Approach | When Sorting Happens | Cost per Query |
+|----------|---------------------|----------------|
+| SQL | At query time, every dispatch | O(F log F) |
+| Redis | At insert time, once per frame | O(log F + K) |
+
+We **amortize** the sorting cost across inserts rather than paying it on every dispatch query.
+
+### Real-World Impact
+
+**Example: Job with 100K waiting frames across 10 layers**
+
+| Metric | SQL | Lua |
+|--------|-----|-----|
+| Frames to sort | 100,000 | 0 (pre-sorted) |
+| Layers to sort | N/A | 10 |
+| Sort complexity | O(100K × log 100K) ≈ 1.7M ops | O(10 × log 10) ≈ 33 ops |
+| Frame access | Scan 100K rows | ZRANGE top-N from 10 sets |
+
+**The Lua algorithm is O(L log L) instead of O(F log F)** — sorting layers vs frames is a 4-5 orders of magnitude difference at scale!
+
+### Additional Optimization: Resource-Aware Selection
+
+SQL returns frames in fixed order, hoping some will fit. Lua tracks remaining resources and stops early:
+
+```lua
+-- Lua can calculate exactly how many frames fit
+local canFitCores = math.floor(remainingCores / layer.minCores)
+local canFitMemory = math.floor(remainingMemory / layer.minMemory)
+local canFit = math.min(canFitCores, canFitMemory)
+
+-- Only fetch what we need, then stop
+local frames = redis.call('ZRANGE', framesWaitingKey, 0, canFit - 1)
+```
+
+SQL would need multiple round-trips or complex window functions to achieve the same result.
+
+---
+
 ## Memory Usage Estimates
 
 ### Per-Entity Memory
