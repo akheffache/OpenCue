@@ -19,6 +19,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.event.TransactionPhase;
@@ -26,6 +28,8 @@ import org.springframework.transaction.event.TransactionalEventListener;
 
 import com.imageworks.spcue.grpc.job.FrameState;
 
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -63,6 +67,28 @@ public class RedisSchedulingEventListener {
     private static final String JOB_PREFIX = "job:";
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
+
+    /**
+     * Atomically remove a layer from layers:waiting:{jobId} ONLY if its
+     * frames:waiting:{layerId} sorted set is empty.
+     *
+     * Eliminates the race between ZCARD and SREM where a concurrent WAITING
+     * event could SADD the layer back between the two commands, leaving the
+     * layer invisible to the dispatcher even though it has a waiting frame.
+     *
+     * KEYS[1] = frames:waiting:{layerId}
+     * KEYS[2] = layers:waiting:{jobId}
+     * ARGV[1] = layerId
+     * Returns: 1 if layer was removed, 0 otherwise
+     */
+    private static final RedisScript<Long> CLEANUP_WAITING_LAYER_SCRIPT =
+            new DefaultRedisScript<>(
+                    "if tonumber(redis.call('ZCARD', KEYS[1])) == 0 then "
+                  + "  redis.call('SREM', KEYS[2], ARGV[1]) "
+                  + "  return 1 "
+                  + "end "
+                  + "return 0",
+                    Long.class);
 
     public RedisSchedulingEventListener(RedisTemplate<String, String> redisTemplate) {
         this.redisTemplate = redisTemplate;
@@ -108,16 +134,15 @@ public class RedisSchedulingEventListener {
                 redisTemplate.opsForZSet().remove(waitingSetKey, frameId);
                 redisTemplate.delete(FRAME_PREFIX + frameId);
 
-                // Check if layer still has waiting frames and clean up layers:waiting set.
-                // Note: There's a small race window where another thread could add a frame
-                // between size() and remove(). However, this is self-healing because:
-                // 1. When a frame becomes WAITING, it always does SADD to layers:waiting (line 98)
-                // 2. So even if we incorrectly remove the layer, it gets re-added immediately
-                // 3. Worst case: one dispatch cycle sees empty set, falls back to SQL
-                Long waitingCount = redisTemplate.opsForZSet().size(waitingSetKey);
-                if (waitingCount == null || waitingCount == 0) {
-                    redisTemplate.opsForSet().remove(LAYERS_WAITING_PREFIX + jobId, layerId);
-                }
+                // Atomically: if frames:waiting:{layerId} is now empty, SREM the layer
+                // from layers:waiting:{jobId}. Replaces the previous size()+remove() pair
+                // which had a race window where a concurrent WAITING event could SADD the
+                // layer between the two commands, leaving it visible in the per-layer set
+                // but absent from the per-job set (i.e. invisible to the dispatcher).
+                redisTemplate.execute(
+                        CLEANUP_WAITING_LAYER_SCRIPT,
+                        Arrays.asList(waitingSetKey, LAYERS_WAITING_PREFIX + jobId),
+                        layerId);
 
                 logger.debug("Removed frame {} from waiting set {} and deleted hash", frameId, waitingSetKey);
             }
