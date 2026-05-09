@@ -50,12 +50,15 @@ public class RedisDispatchSupport {
 
     private final RedisDispatchCache redisDispatchCache;
     private final DispatcherDao sqlDispatcherDao;
+    private final RedisCacheLoadService redisCacheLoadService;
 
     @Autowired
     public RedisDispatchSupport(RedisDispatchCache redisDispatchCache,
-                                 DispatcherDao sqlDispatcherDao) {
+                                 DispatcherDao sqlDispatcherDao,
+                                 RedisCacheLoadService redisCacheLoadService) {
         this.redisDispatchCache = redisDispatchCache;
         this.sqlDispatcherDao = sqlDispatcherDao;
+        this.redisCacheLoadService = redisCacheLoadService;
         logger.info("Redis dispatch support initialized - Redis-first frame dispatch enabled");
     }
 
@@ -69,6 +72,13 @@ public class RedisDispatchSupport {
      */
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, DispatchHost host, int limit) {
         long startTime = System.currentTimeMillis();
+
+        // Skip Redis entirely until the cache load has finished (initial load
+        // locally, or a peer's load if we deferred). Avoids serving empty or
+        // partial results from a half-populated cache.
+        if (!redisCacheLoadService.isReady()) {
+            return sqlDispatcherDao.findNextDispatchFrames(job, host, limit);
+        }
 
         // Check if Redis has data for this job
         if (redisDispatchCache.hasJobData(job.getJobId())) {
@@ -100,6 +110,10 @@ public class RedisDispatchSupport {
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, VirtualProc proc, int limit) {
         long startTime = System.currentTimeMillis();
 
+        if (!redisCacheLoadService.isReady()) {
+            return sqlDispatcherDao.findNextDispatchFrames(job, proc, limit);
+        }
+
         if (redisDispatchCache.hasJobData(job.getJobId())) {
             List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, proc, limit);
 
@@ -118,7 +132,7 @@ public class RedisDispatchSupport {
      * Check if Redis dispatch is available for a job.
      */
     public boolean isRedisAvailableForJob(String jobId) {
-        return redisDispatchCache.hasJobData(jobId);
+        return redisCacheLoadService.isReady() && redisDispatchCache.hasJobData(jobId);
     }
 
     // ============================================================
@@ -130,6 +144,10 @@ public class RedisDispatchSupport {
      */
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host, int limit) {
         long startTime = System.currentTimeMillis();
+
+        if (!redisCacheLoadService.isReady()) {
+            return sqlDispatcherDao.findNextDispatchFrames(layer, host, limit);
+        }
 
         List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(layer, host, limit);
 
@@ -148,6 +166,10 @@ public class RedisDispatchSupport {
      */
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, VirtualProc proc, int limit) {
         long startTime = System.currentTimeMillis();
+
+        if (!redisCacheLoadService.isReady()) {
+            return sqlDispatcherDao.findNextDispatchFrames(layer, proc, limit);
+        }
 
         List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(layer, proc, limit);
 

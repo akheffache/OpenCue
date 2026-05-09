@@ -49,9 +49,11 @@ import com.imageworks.spcue.dao.JobDao;
  * This ensures Redis has correct data after a cuebot restart.
  * Once populated, incremental updates are handled by event publishing.
  *
- * The load runs SYNCHRONOUSLY at startup - the application will not
- * accept scheduling requests until load is complete. This is simpler
- * and safer than async load with ready flags.
+ * The load runs SYNCHRONOUSLY at startup. The dispatcher consults
+ * {@link #isReady()} before querying Redis and falls back to SQL while
+ * the cache is still being populated (locally, or by a peer cuebot we
+ * are waiting on). This avoids serving empty/partial results from a
+ * half-populated cache during multi-cuebot startup.
  */
 @Service
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
@@ -76,8 +78,20 @@ public class RedisCacheLoadService {
     private static final String LOAD_LOCK_KEY = "cuebot:load:lock";
     private static final long LOAD_LOCK_TIMEOUT_MINUTES = 5;
 
+    // Peer-load wait: how often to poll for the peer's lock to be released,
+    // and the maximum total time to wait before giving up and using SQL fallback.
+    private static final long PEER_WAIT_POLL_MS = 1000L;
+    private static final long PEER_WAIT_TIMEOUT_MS =
+            TimeUnit.MINUTES.toMillis(LOAD_LOCK_TIMEOUT_MINUTES);
+
     // Unique instance ID for lock ownership
     private final String instanceId = UUID.randomUUID().toString();
+
+    // True once Redis is safe to query for dispatch (initial load finished
+    // locally, OR a peer instance finished its load while we waited).
+    // The dispatcher consults this flag and falls back to SQL while it is false,
+    // avoiding the partially-populated Redis window during multi-cuebot startup.
+    private volatile boolean ready = false;
 
     /**
      * If true, flush Redis before loading. Use with caution - only when you are
@@ -129,6 +143,7 @@ public class RedisCacheLoadService {
                     });
                 }
                 loadCache();
+                ready = true;
             } finally {
                 // Only release if we still own the lock (could have expired)
                 String currentOwner = redisTemplate.opsForValue().get(LOAD_LOCK_KEY);
@@ -140,8 +155,54 @@ public class RedisCacheLoadService {
                 }
             }
         } else {
-            logger.info("Another cuebot instance is loading Redis, skipping (SQL fallback available)");
+            logger.info("Another cuebot instance is loading Redis, waiting for peer to finish " +
+                        "(SQL fallback active until ready)");
+            waitForPeerLoad();
         }
+    }
+
+    /**
+     * Wait (with timeout) for the peer cuebot's load lock to be released.
+     *
+     * Until the peer finishes, Redis may be partially populated and unsafe for
+     * dispatch queries. The dispatcher gates on isReady() and falls back to SQL
+     * while we wait. Once the lock is released, we mark ourselves ready and the
+     * dispatcher starts using Redis.
+     *
+     * If the timeout elapses (peer crashed, network split, etc.), we stay
+     * not-ready and continue using SQL fallback. A subsequent cuebot restart
+     * (or admin) will need to clean up.
+     */
+    private void waitForPeerLoad() {
+        long deadline = System.currentTimeMillis() + PEER_WAIT_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(PEER_WAIT_POLL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.warn("Interrupted while waiting for peer load - staying in SQL fallback");
+                return;
+            }
+            String owner = redisTemplate.opsForValue().get(LOAD_LOCK_KEY);
+            if (owner == null) {
+                logger.info("Peer cuebot finished loading Redis - marking ready");
+                ready = true;
+                return;
+            }
+        }
+        logger.warn("Timed out waiting for peer cuebot load ({} min) - staying in SQL fallback",
+                    LOAD_LOCK_TIMEOUT_MINUTES);
+    }
+
+    /**
+     * Returns true when Redis is safe to query for dispatch.
+     *
+     * False during the initial load window (and during a peer's load if we
+     * skipped our own). The dispatcher should fall back to SQL while this is
+     * false to avoid serving empty/partial results from a half-populated cache.
+     */
+    public boolean isReady() {
+        return ready;
     }
 
     /**
