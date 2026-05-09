@@ -15,6 +15,8 @@
 
 package com.imageworks.spcue.dispatcher.redis_cache;
 
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -22,6 +24,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import javax.annotation.PostConstruct;
 
@@ -388,7 +391,6 @@ public class RedisCacheLoadService {
                     layerData.put("jobId", layerJobId);
                     layerData.put("name", (String) row.get("str_name"));
                     layerData.put("type", (String) row.get("str_type"));
-                    layerData.put("tags", nullToEmpty(row.get("str_tags")));
                     layerData.put("command", nullToEmpty(row.get("str_cmd")));
                     layerData.put("range", nullToEmpty(row.get("str_range")));
                     layerData.put("chunkSize", String.valueOf(row.get("int_chunk_size")));
@@ -402,6 +404,12 @@ public class RedisCacheLoadService {
                     layerData.put("threadable", String.valueOf(row.get("b_threadable")));
 
                     operations.opsForHash().putAll(layerKey, layerData);
+
+                    // Store layer tags as SET for efficient matching (no string parsing in Lua)
+                    Set<String> normalizedTags = normalizeTags(nullToEmpty(row.get("str_tags")));
+                    if (!normalizedTags.isEmpty()) {
+                        operations.opsForSet().add(layerKey + ":tags", normalizedTags.toArray(new String[0]));
+                    }
 
                     // Track layers with waiting frames
                     if (waitingCount > 0) {
@@ -516,6 +524,24 @@ public class RedisCacheLoadService {
 
     private String nullToEmpty(Object value) {
         return value != null ? value.toString() : "";
+    }
+
+    /**
+     * Normalize tags string to a set of lowercase, trimmed tags.
+     * Centralized logic to ensure consistent tag handling across Java and Lua.
+     *
+     * @param tagString Pipe-separated tag string (e.g., "Render | Linux")
+     * @return Set of normalized tags (e.g., ["render", "linux"])
+     */
+    static Set<String> normalizeTags(String tagString) {
+        if (tagString == null || tagString.isEmpty()) {
+            return Collections.emptySet();
+        }
+        return Arrays.stream(tagString.split("\\|"))
+                .map(String::trim)
+                .map(String::toLowerCase)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toSet());
     }
 
     // ============================================================

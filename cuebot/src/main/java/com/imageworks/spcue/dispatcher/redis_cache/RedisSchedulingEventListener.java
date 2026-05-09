@@ -197,13 +197,20 @@ public class RedisSchedulingEventListener {
             layerData.put("maxGpus", String.valueOf(event.getMaxGpus()));
             layerData.put("minGpuMemory", String.valueOf(event.getMinGpuMemory()));
             layerData.put("threadable", String.valueOf(event.isThreadable()));
-            layerData.put("tags", event.getTags() != null ? event.getTags() : "");
             layerData.put("command", event.getCommand() != null ? event.getCommand() : "");
             layerData.put("range", event.getRange() != null ? event.getRange() : "");
             layerData.put("chunkSize", String.valueOf(event.getChunkSize()));
             layerData.put("services", event.getServices() != null ? event.getServices() : "");
 
             redisTemplate.opsForHash().putAll(layerKey, layerData);
+
+            // Store layer tags as SET for efficient matching (no string parsing in Lua)
+            String layerTagsKey = layerKey + ":tags";
+            redisTemplate.delete(layerTagsKey); // Clear existing tags
+            Set<String> normalizedTags = RedisCacheLoadService.normalizeTags(event.getTags());
+            if (!normalizedTags.isEmpty()) {
+                redisTemplate.opsForSet().add(layerTagsKey, normalizedTags.toArray(new String[0]));
+            }
 
             // Store layer limits - CRITICAL for 1-to-1 parity with SQL
             if (event.hasLimits()) {
@@ -308,6 +315,8 @@ public class RedisSchedulingEventListener {
                     redisTemplate.delete(LAYER_PREFIX + layerId);
                     // Delete layer limits set
                     redisTemplate.delete(LAYER_LIMITS_PREFIX + layerId);
+                    // Delete layer tags set
+                    redisTemplate.delete(LAYER_PREFIX + layerId + ":tags");
                 }
             }
 

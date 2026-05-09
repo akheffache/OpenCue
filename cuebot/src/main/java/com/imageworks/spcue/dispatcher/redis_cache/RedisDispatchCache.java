@@ -20,6 +20,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -398,36 +399,46 @@ public class RedisDispatchCache {
     private List<String> executeFrameSearch(JobInterface job, DispatchHost host, int limit, boolean noGpu) {
         String layersWaitingKey = LAYERS_WAITING_PREFIX + job.getJobId();
         int threadMode = (host.threadMode == ThreadMode.ALL_VALUE) ? 1 : 0;
+        Set<String> normalizedTags = RedisCacheLoadService.normalizeTags(host.tags);
+
+        List<Object> args = new ArrayList<>();
+        args.add(String.valueOf(host.idleCores));
+        args.add(String.valueOf(host.idleMemory));
+        args.add(String.valueOf(host.idleGpus));
+        args.add(String.valueOf(host.idleGpuMemory));
+        args.add(String.valueOf(threadMode));
+        args.add(String.valueOf(limit));
+        args.add(noGpu ? "1" : "0");
+        args.add(String.valueOf(normalizedTags.size()));
+        args.addAll(normalizedTags);
 
         return redisTemplate.execute(
                 findDispatchFramesScript,
                 Collections.singletonList(layersWaitingKey),
-                String.valueOf(host.idleCores),
-                String.valueOf(host.idleMemory),
-                String.valueOf(host.idleGpus),
-                String.valueOf(host.idleGpuMemory),
-                host.tags != null ? host.tags : "",
-                String.valueOf(threadMode),
-                String.valueOf(limit),
-                noGpu ? "1" : "0"
+                args.toArray()
         );
     }
 
     @SuppressWarnings("unchecked")
     private List<String> executeFrameSearchByProc(JobInterface job, VirtualProc proc, int limit, boolean noGpu) {
         String layersWaitingKey = LAYERS_WAITING_PREFIX + job.getJobId();
+        Set<String> normalizedTags = RedisCacheLoadService.normalizeTags(proc.tags);
+
+        List<Object> args = new ArrayList<>();
+        args.add(String.valueOf(proc.coresReserved));
+        args.add(String.valueOf(proc.memoryReserved));
+        args.add(String.valueOf(proc.gpusReserved));
+        args.add(String.valueOf(proc.gpuMemoryReserved));
+        args.add("1"); // Proc dispatch doesn't check threadable
+        args.add(String.valueOf(limit));
+        args.add(noGpu ? "1" : "0");
+        args.add(String.valueOf(normalizedTags.size()));
+        args.addAll(normalizedTags);
 
         return redisTemplate.execute(
                 findDispatchFramesScript,
                 Collections.singletonList(layersWaitingKey),
-                String.valueOf(proc.coresReserved),
-                String.valueOf(proc.memoryReserved),
-                String.valueOf(proc.gpusReserved),
-                String.valueOf(proc.gpuMemoryReserved),
-                proc.tags != null ? proc.tags : "",
-                "1", // Proc dispatch doesn't check threadable
-                String.valueOf(limit),
-                noGpu ? "1" : "0"
+                args.toArray()
         );
     }
 
@@ -437,18 +448,23 @@ public class RedisDispatchCache {
         String framesWaitingKey = FRAMES_WAITING_PREFIX + layer.getLayerId();
         String layerLimitsKey = LAYER_LIMITS_PREFIX + layer.getLayerId();
         int threadMode = (host.threadMode == ThreadMode.ALL_VALUE) ? 1 : 0;
+        Set<String> normalizedTags = RedisCacheLoadService.normalizeTags(host.tags);
+
+        List<Object> args = new ArrayList<>();
+        args.add(String.valueOf(host.idleCores));
+        args.add(String.valueOf(host.idleMemory));
+        args.add(String.valueOf(host.idleGpus));
+        args.add(String.valueOf(host.idleGpuMemory));
+        args.add(String.valueOf(threadMode));
+        args.add(String.valueOf(limit));
+        args.add(noGpu ? "1" : "0");
+        args.add(String.valueOf(normalizedTags.size()));
+        args.addAll(normalizedTags);
 
         return redisTemplate.execute(
                 findDispatchFramesByLayerScript,
                 java.util.Arrays.asList(layerKey, framesWaitingKey, layerLimitsKey),
-                String.valueOf(host.idleCores),
-                String.valueOf(host.idleMemory),
-                String.valueOf(host.idleGpus),
-                String.valueOf(host.idleGpuMemory),
-                host.tags != null ? host.tags : "",
-                String.valueOf(threadMode),
-                String.valueOf(limit),
-                noGpu ? "1" : "0"
+                args.toArray()
         );
     }
 
@@ -457,18 +473,23 @@ public class RedisDispatchCache {
         String layerKey = LAYER_PREFIX + layer.getLayerId();
         String framesWaitingKey = FRAMES_WAITING_PREFIX + layer.getLayerId();
         String layerLimitsKey = LAYER_LIMITS_PREFIX + layer.getLayerId();
+        Set<String> normalizedTags = RedisCacheLoadService.normalizeTags(proc.tags);
+
+        List<Object> args = new ArrayList<>();
+        args.add(String.valueOf(proc.coresReserved));
+        args.add(String.valueOf(proc.memoryReserved));
+        args.add(String.valueOf(proc.gpusReserved));
+        args.add(String.valueOf(proc.gpuMemoryReserved));
+        args.add("1"); // Proc dispatch doesn't check threadable
+        args.add(String.valueOf(limit));
+        args.add(noGpu ? "1" : "0");
+        args.add(String.valueOf(normalizedTags.size()));
+        args.addAll(normalizedTags);
 
         return redisTemplate.execute(
                 findDispatchFramesByLayerScript,
                 java.util.Arrays.asList(layerKey, framesWaitingKey, layerLimitsKey),
-                String.valueOf(proc.coresReserved),
-                String.valueOf(proc.memoryReserved),
-                String.valueOf(proc.gpusReserved),
-                String.valueOf(proc.gpuMemoryReserved),
-                proc.tags != null ? proc.tags : "",
-                "1", // Proc dispatch doesn't check threadable
-                String.valueOf(limit),
-                noGpu ? "1" : "0"
+                args.toArray()
         );
     }
 

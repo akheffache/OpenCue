@@ -17,10 +17,11 @@
     ARGV[2] = hostMemory    - Available memory on host (bytes)
     ARGV[3] = hostGpus      - Available GPUs on host
     ARGV[4] = hostGpuMemory - Available GPU memory on host (bytes)
-    ARGV[5] = hostTags      - Comma-separated list of host tags
-    ARGV[6] = threadMode    - 0 = AUTO, 1 = ALL (for threadable check)
-    ARGV[7] = limit         - Maximum number of frames to return
-    ARGV[8] = noGpu         - 1 = skip GPU checks (NO_GPU mode), 0 = normal
+    ARGV[5] = threadMode    - 0 = AUTO, 1 = ALL (for threadable check)
+    ARGV[6] = limit         - Maximum number of frames to return
+    ARGV[7] = noGpu         - 1 = skip GPU checks (NO_GPU mode), 0 = normal
+    ARGV[8] = tagCount      - Number of host tags
+    ARGV[9+] = hostTags     - Individual host tags (pre-normalized in Java)
 
   Returns:
     List of frame IDs that match the criteria, ordered by dispatch order
@@ -31,10 +32,16 @@ local hostCores = tonumber(ARGV[1])
 local hostMemory = tonumber(ARGV[2])
 local hostGpus = tonumber(ARGV[3])
 local hostGpuMemory = tonumber(ARGV[4])
-local hostTags = ARGV[5]
-local threadMode = tonumber(ARGV[6])
-local limit = tonumber(ARGV[7])
-local noGpu = tonumber(ARGV[8] or 0)
+local threadMode = tonumber(ARGV[5])
+local limit = tonumber(ARGV[6])
+local noGpu = tonumber(ARGV[7] or 0)
+local tagCount = tonumber(ARGV[8] or 0)
+
+-- Build host tag set from ARGV (no string parsing - tags pre-normalized in Java)
+local hostTagSet = {}
+for i = 1, tagCount do
+    hostTagSet[ARGV[8 + i]] = true
+end
 
 -- Track remaining resources as we select frames
 local remainingCores = hostCores
@@ -45,37 +52,26 @@ local remainingGpuMemory = hostGpuMemory
 -- Max frames to fetch per layer (prevents O(n) memory on huge jobs)
 local MAX_FRAMES_PER_LAYER = 1000
 
--- Helper function to check if host tags match layer tags using word boundaries
--- SQL: host.str_tags ~* ('(?x)' || layer.str_tags || '\y')
--- This matches whole words, not substrings
-local function tagsMatch(hostTagStr, layerTagPattern)
-    if layerTagPattern == nil or layerTagPattern == '' then
+-- Helper function to check if host tags satisfy layer's required tags.
+-- Layer tags are stored as a SET in Redis (layer:{id}:tags).
+-- Host tags are passed as pre-normalized values from Java.
+-- Returns true if ALL layer required tags are present in hostTagSet.
+local function tagsMatch(layerId, hostTagSet)
+    local layerTagsKey = 'layer:' .. layerId .. ':tags'
+    local requiredTags = redis.call('SMEMBERS', layerTagsKey)
+
+    -- No required tags = layer can run on any host
+    if #requiredTags == 0 then
         return true
     end
 
-    local hostTagsLower = string.lower(hostTagStr)
-    local patternLower = string.lower(layerTagPattern)
-
-    -- Split pattern by | (OR in regex)
-    for pattern in string.gmatch(patternLower, "[^|]+") do
-        pattern = pattern:gsub("^%s*(.-)%s*$", "%1") -- trim
-
-        -- Word boundary matching: check if pattern appears as a whole word
-        -- Check for pattern at start, end, or surrounded by non-word chars
-        local wordPattern = "%f[%w]" .. pattern:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1") .. "%f[%W]"
-        if string.find(hostTagsLower, wordPattern) then
-            return true
-        end
-
-        -- Also check exact match for simple cases
-        for tag in string.gmatch(hostTagsLower, "[%w_]+") do
-            if tag == pattern then
-                return true
-            end
+    -- Check all required tags are in host's tag set
+    for _, reqTag in ipairs(requiredTags) do
+        if not hostTagSet[reqTag] then
+            return false
         end
     end
-
-    return false
+    return true
 end
 
 -- Helper function to check if layer limits allow dispatch
@@ -131,7 +127,6 @@ for _, layerId in ipairs(layerIds) do
         local minGpus = tonumber(layer['minGpus'] or 0)
         local minGpuMemory = tonumber(layer['minGpuMemory'] or 0)
         local threadable = layer['threadable'] == 'true'
-        local layerTags = layer['tags'] or ''
 
         -- Check static requirements (don't depend on remaining resources)
         local eligible = true
@@ -142,8 +137,8 @@ for _, layerId in ipairs(layerIds) do
             eligible = false
         end
 
-        -- Check tags (with word boundary matching)
-        if eligible and not tagsMatch(hostTags, layerTags) then
+        -- Check tags (layer tags stored as SET, host tags from ARGV)
+        if eligible and not tagsMatch(layerId, hostTagSet) then
             eligible = false
         end
 
