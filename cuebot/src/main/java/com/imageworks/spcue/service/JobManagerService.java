@@ -64,7 +64,7 @@ import com.imageworks.spcue.util.FrameSet;
 import com.imageworks.spcue.util.JobLogUtil;
 import com.imageworks.spcue.util.Convert;
 import com.imageworks.spcue.dao.SchedulingEventPublisher;
-import com.imageworks.spcue.dispatcher.redis_cache.RedisCacheWarmupService;
+import com.imageworks.spcue.dispatcher.redis_cache.RedisCacheLoadService;
 
 import org.springframework.beans.factory.annotation.Autowired;
 
@@ -85,7 +85,7 @@ public class JobManagerService implements JobManager {
     private FacilityDao facilityDao;
     private JobLogUtil jobLogUtil;
     private SchedulingEventPublisher schedulingEventPublisher;
-    private RedisCacheWarmupService redisCacheWarmupService;
+    private RedisCacheLoadService redisCacheLoadService;
 
     /**
      * Set the scheduling event publisher for Redis cache synchronization.
@@ -101,14 +101,14 @@ public class JobManagerService implements JobManager {
     }
 
     /**
-     * Set the Redis cache warmup service for populating new job data.
+     * Set the Redis cache load service for populating new job data.
      * Autowired with required=false so it works whether Redis is enabled or not.
      */
     @Autowired(required = false)
-    public void setRedisCacheWarmupService(RedisCacheWarmupService redisCacheWarmupService) {
-        this.redisCacheWarmupService = redisCacheWarmupService;
-        if (redisCacheWarmupService != null) {
-            logger.info("Redis cache warmup service configured in JobManagerService");
+    public void setRedisCacheLoadService(RedisCacheLoadService redisCacheLoadService) {
+        this.redisCacheLoadService = redisCacheLoadService;
+        if (redisCacheLoadService != null) {
+            logger.info("Redis cache load service configured in JobManagerService");
         }
     }
 
@@ -228,13 +228,13 @@ public class JobManagerService implements JobManager {
         for (BuildableJob job : spec.getJobs()) {
             jobDao.activateJob(job.detail, JobState.PENDING);
             job.detail.state = JobState.PENDING;
-            // Warm up Redis cache with layers and frames for this job
+            // Load job data into Redis cache (layers and frames)
             // (Job finding uses SQL, but frame dispatch uses Redis)
-            if (redisCacheWarmupService != null) {
+            if (redisCacheLoadService != null) {
                 try {
-                    redisCacheWarmupService.warmupJob(job.detail.id);
+                    redisCacheLoadService.loadJob(job.detail.id);
                 } catch (Exception e) {
-                    logger.warn("Failed to warm up Redis cache for job: {}", job.detail.id, e);
+                    logger.warn("Failed to load Redis cache for job: {}", job.detail.id, e);
                 }
             }
             if (job.getPostJob() != null) {

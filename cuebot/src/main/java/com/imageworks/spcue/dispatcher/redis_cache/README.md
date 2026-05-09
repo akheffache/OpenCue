@@ -102,8 +102,8 @@ Use Lua scripts for atomic, server-side filtering and selection.
 
 ### Data Flow
 
-1. **Startup**: `RedisCacheWarmupService` loads job metadata, layers, and WAITING frames from SQL into Redis
-2. **New Job Launch**: `warmupJob()` populates Redis with the new job's layers and frames
+1. **Startup**: `RedisCacheLoadService` loads job metadata, layers, and WAITING frames from SQL into Redis
+2. **New Job Launch**: `loadJob()` populates Redis with the new job's layers and frames
 3. **Runtime Changes**: Event listeners update Redis after SQL transactions commit
 4. **Dispatch Queries**: Lua scripts query Redis atomically, with SQL fallback if needed
 5. **Booking**: SQL remains the source of truth; Redis is updated via events after commit
@@ -230,16 +230,16 @@ public void onFrameStateChanged(FrameStateChangedEvent event) {
 }
 ```
 
-## Cache Warmup
+## Cache Loading
 
-### Startup Warmup
+### Startup Loading
 
-`RedisCacheWarmupService.init()` runs synchronously at startup via `@PostConstruct`:
+`RedisCacheLoadService.init()` runs synchronously at startup via `@PostConstruct`:
 
 ```java
 @PostConstruct
 public void init() {
-    warmupCache();  // Blocks until complete
+    loadCache();  // Blocks until complete
 }
 ```
 
@@ -249,18 +249,18 @@ Order of population:
 3. **Layers** - All layers for active jobs
 4. **Frames** - All WAITING frames for active jobs
 
-### New Job Warmup
+### New Job Loading
 
-When a job is launched after startup, `warmupJob()` is called:
+When a job is launched after startup, `loadJob()` is called:
 
 ```java
 // In JobManagerService.launchJobSpec()
 jobDao.activateJob(job.detail, JobState.PENDING);
 
-// Warm up Redis cache with layers and frames for this job
+// Load Redis cache with layers and frames for this job
 // (Job finding uses SQL, but frame dispatch uses Redis)
-if (redisCacheWarmupService != null) {
-    redisCacheWarmupService.warmupJob(job.detail.id);
+if (redisCacheLoadService != null) {
+    redisCacheLoadService.loadJob(job.detail.id);
 }
 ```
 
@@ -431,7 +431,7 @@ cuebot/src/main/java/com/imageworks/spcue/dao/redis/
 ├── LayerUpdatedEvent.java           # Layer update event
 ├── RedisDispatcherDao.java          # Redis queries with Lua
 ├── RedisDispatchSupport.java        # Redis-first with SQL fallback
-└── RedisCacheWarmupService.java     # Startup and job warmup
+└── RedisCacheLoadService.java     # Startup and job loading
 
 cuebot/src/main/resources/lua/
 ├── find_dispatch_frames.lua         # Job-based frame dispatch
@@ -485,10 +485,10 @@ Multiple cuebots can share the same Redis instance:
 
 | Failure | Impact | Recovery |
 |---------|--------|----------|
-| Redis down | SQL fallback, slower dispatch | Restart Redis, warmup runs |
+| Redis down | SQL fallback, slower dispatch | Restart Redis, loading runs |
 | Redis data stale | May query wrong frames | SQL booking prevents errors |
 | Event lost | Redis misses update | Frame still books via SQL |
-| Warmup fails | Empty Redis | SQL fallback works |
+| Loading fails | Empty Redis | SQL fallback works |
 
 ### Monitoring
 
@@ -601,7 +601,7 @@ A user submits a job with 1000 frames across 2 layers.
 | 1.1 | `JobLauncher` | Receives job spec via gRPC |
 | 1.2 | `JobManagerService.launchJobSpec()` | Creates job, layers, frames in PostgreSQL |
 | 1.3 | `JobDao.activateJob()` | Sets job state to `PENDING` in SQL |
-| 1.4 | `RedisCacheWarmupService.warmupJob()` | Populates Redis with job data |
+| 1.4 | `RedisCacheLoadService.loadJob()` | Populates Redis with job data |
 
 **Redis after Step 1.4:**
 ```

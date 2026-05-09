@@ -82,17 +82,17 @@ JobManagerService.launchJobSpec()
         │
         ├──► jobDao.activateJob() ──► Set job state to PENDING
         │
-        └──► redisCacheWarmupService.warmupJob(jobId)
+        └──► redisCacheLoadService.loadJob(jobId)
                     │
-                    ├──► warmupSingleJobMetadata() ──► Uses JobDao.getJobDetail()
-                    │                                   Populates job:{jobId} hash
+                    ├──► loadSingleJobMetadata() ──► Uses JobDao.getJobDetail()
+                    │                                 Populates job:{jobId} hash
                     │
-                    ├──► warmupJobLayers() ──► Populates layer:{layerId} hashes
-                    │                          Populates layers:waiting:{jobId} set
-                    │                          Populates layer:limits:{layerId} sets
+                    ├──► loadLayers() ──► Populates layer:{layerId} hashes
+                    │                      Populates layers:waiting:{jobId} set
+                    │                      Populates layer:limits:{layerId} sets
                     │
-                    └──► warmupJobFrames() ──► Populates frame:{frameId} hashes
-                                               Populates frames:waiting:{layerId} sorted sets
+                    └──► loadWaitingFrames() ──► Populates frame:{frameId} hashes
+                                                  Populates frames:waiting:{layerId} sorted sets
 ```
 
 ### Source Files
@@ -103,11 +103,11 @@ JobManagerService.launchJobSpec()
 
 2. **[JobManagerService.java](../../service/JobManagerService.java)** (lines 202-244)
    - `launchJobSpec()` creates the job in SQL
-   - Calls `redisCacheWarmupService.warmupJob()` after job is created
+   - Calls `redisCacheLoadService.loadJob()` after job is created
 
-3. **[RedisCacheWarmupService.java](RedisCacheWarmupService.java)**
-   - **Startup warmup** (lines 80-118): `warmupCache()` runs at `@PostConstruct`, bulk-loads all pending jobs
-   - **Single job warmup** (lines 450-468): `warmupJob(jobId)` for newly launched jobs
+3. **[RedisCacheLoadService.java](RedisCacheLoadService.java)**
+   - **Startup load** (lines 80-118): `loadCache()` runs at `@PostConstruct`, bulk-loads all pending jobs
+   - **Single job load** (lines 450-468): `loadJob(jobId)` for newly launched jobs
    - Uses `JobDao.getJobDetail()` for type-safe job data retrieval (lines 260-303)
 
 ### Redis Data Structures Created
@@ -234,7 +234,7 @@ When disabled, the system falls back to pure SQL dispatch (original behavior).
 | Flow | SQL Role | Redis Role |
 |------|----------|------------|
 | Frame State Change | Source of truth (writes) | Eventually consistent cache (reads) |
-| Job Launch | Creates job/layers/frames | Warmed up after SQL commit |
+| Job Launch | Creates job/layers/frames | Loaded after SQL commit |
 | Frame Dispatch | Job finding | Frame finding (zero SQL on hot path) |
 
 The architecture ensures:

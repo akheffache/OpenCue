@@ -46,15 +46,15 @@ import com.imageworks.spcue.grpc.job.FrameState;
  * This ensures Redis has correct data after a cuebot restart.
  * Once populated, incremental updates are handled by event publishing.
  *
- * The warm-up runs SYNCHRONOUSLY at startup - the application will not
- * accept scheduling requests until warmup is complete. This is simpler
- * and safer than async warmup with ready flags.
+ * The load runs SYNCHRONOUSLY at startup - the application will not
+ * accept scheduling requests until load is complete. This is simpler
+ * and safer than async load with ready flags.
  */
 @Service
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
-public class RedisCacheWarmupService {
+public class RedisCacheLoadService {
 
-    private static final Logger logger = LogManager.getLogger(RedisCacheWarmupService.class);
+    private static final Logger logger = LogManager.getLogger(RedisCacheLoadService.class);
 
     private final RedisTemplate<String, String> redisTemplate;
     private final JdbcTemplate jdbcTemplate;
@@ -69,15 +69,15 @@ public class RedisCacheWarmupService {
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
-    // Distributed lock for warmup (prevents concurrent warmup from multiple cuebots)
-    private static final String WARMUP_LOCK_KEY = "cuebot:warmup:lock";
-    private static final long WARMUP_LOCK_TIMEOUT_MINUTES = 5;
+    // Distributed lock for load (prevents concurrent load from multiple cuebots)
+    private static final String LOAD_LOCK_KEY = "cuebot:load:lock";
+    private static final long LOAD_LOCK_TIMEOUT_MINUTES = 5;
 
     // Unique instance ID for lock ownership
     private final String instanceId = UUID.randomUUID().toString();
 
     @Autowired
-    public RedisCacheWarmupService(RedisTemplate<String, String> redisTemplate,
+    public RedisCacheLoadService(RedisTemplate<String, String> redisTemplate,
                                     JdbcTemplate jdbcTemplate,
                                     JobDao jobDao) {
         this.redisTemplate = redisTemplate;
@@ -86,69 +86,69 @@ public class RedisCacheWarmupService {
     }
 
     /**
-     * Warm up Redis cache at application startup.
+     * Load Redis cache at application startup.
      * Runs SYNCHRONOUSLY - application won't accept requests until complete.
      *
-     * Uses a distributed lock to prevent concurrent warmup from multiple cuebots.
-     * If another instance is already warming up, this instance skips warmup
+     * Uses a distributed lock to prevent concurrent load from multiple cuebots.
+     * If another instance is already loading, this instance skips load
      * (the other instance will populate Redis, and we have SQL fallback).
      */
     @PostConstruct
     public void init() {
-        logger.info("Attempting to acquire warmup lock (instance: {})...", instanceId);
+        logger.info("Attempting to acquire load lock (instance: {})...", instanceId);
 
         Boolean acquired = redisTemplate.opsForValue()
-                .setIfAbsent(WARMUP_LOCK_KEY, instanceId, WARMUP_LOCK_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+                .setIfAbsent(LOAD_LOCK_KEY, instanceId, LOAD_LOCK_TIMEOUT_MINUTES, TimeUnit.MINUTES);
 
         if (Boolean.TRUE.equals(acquired)) {
-            logger.info("Warmup lock acquired, starting Redis cache warm-up...");
+            logger.info("Load lock acquired, starting Redis cache load...");
             try {
-                warmupCache();
+                loadCache();
             } finally {
                 // Only release if we still own the lock (could have expired)
-                String currentOwner = redisTemplate.opsForValue().get(WARMUP_LOCK_KEY);
+                String currentOwner = redisTemplate.opsForValue().get(LOAD_LOCK_KEY);
                 if (instanceId.equals(currentOwner)) {
-                    redisTemplate.delete(WARMUP_LOCK_KEY);
-                    logger.info("Warmup lock released");
+                    redisTemplate.delete(LOAD_LOCK_KEY);
+                    logger.info("Load lock released");
                 } else {
-                    logger.warn("Warmup lock expired or was taken by another instance");
+                    logger.warn("Load lock expired or was taken by another instance");
                 }
             }
         } else {
-            logger.info("Another cuebot instance is warming up Redis, skipping (SQL fallback available)");
+            logger.info("Another cuebot instance is loading Redis, skipping (SQL fallback available)");
         }
     }
 
     /**
-     * Main warm-up method - populates Redis from SQL.
+     * Main load method - populates Redis from SQL.
      */
-    public void warmupCache() {
+    public void loadCache() {
         long startTime = System.currentTimeMillis();
-        logger.info("Starting Redis cache warm-up from SQL...");
+        logger.info("Starting Redis cache load from SQL...");
 
         try {
             // Clear existing scheduling data (in case of stale data)
             clearSchedulingData();
 
             // Populate limits first (they're referenced by layers)
-            int limitCount = warmupLimits();
+            int limitCount = loadLimits();
 
             // Populate job metadata (needed for building DispatchFrame objects)
             // Note: Job finding queries stay in SQL - only frame dispatch uses Redis
-            int jobCount = warmupJobMetadata();
+            int jobCount = loadJobMetadata();
 
             // Populate layers and their limits
-            int layerCount = warmupLayers();
+            int layerCount = loadLayers();
 
             // Populate waiting frames
-            int frameCount = warmupWaitingFrames();
+            int frameCount = loadWaitingFrames();
 
             long duration = System.currentTimeMillis() - startTime;
-            logger.info("Redis cache warm-up completed in {}ms: {} jobs, {} layers, {} frames, {} limits",
+            logger.info("Redis cache load completed in {}ms: {} jobs, {} layers, {} frames, {} limits",
                     duration, jobCount, layerCount, frameCount, limitCount);
 
         } catch (Exception e) {
-            logger.error("Redis cache warm-up failed", e);
+            logger.error("Redis cache load failed", e);
             // Don't throw - the system can still work with SQL fallback
         }
     }
@@ -193,7 +193,7 @@ public class RedisCacheWarmupService {
     /**
      * Warm up limit data.
      */
-    private int warmupLimits() {
+    private int loadLimits() {
         String sql = "SELECT lr.pk_limit_record, lr.str_name, lr.int_max_value, " +
                      "COALESCE(SUM(ls.int_running_count), 0) AS int_running " +
                      "FROM limit_record lr " +
@@ -221,7 +221,7 @@ public class RedisCacheWarmupService {
             count++;
         }
 
-        logger.debug("Warmed up {} limits", count);
+        logger.debug("Loaded {} limits", count);
         return count;
     }
 
@@ -231,7 +231,7 @@ public class RedisCacheWarmupService {
      * Note: Job FINDING queries stay in SQL (they're already fast - simple index lookups).
      * We only cache job metadata so we can build DispatchFrame objects from Redis frame data.
      */
-    private int warmupJobMetadata() {
+    private int loadJobMetadata() {
         String sql = "SELECT j.pk_job, j.pk_show, j.pk_folder, j.pk_facility, " +
                      "j.str_name, j.str_state, j.b_paused, j.str_os, j.str_shot, j.str_user, j.str_log_dir, " +
                      "s.str_name AS show_name, " +
@@ -284,7 +284,7 @@ public class RedisCacheWarmupService {
             count++;
         }
 
-        logger.debug("Warmed up {} job metadata entries", count);
+        logger.debug("Loaded {} job metadata entries", count);
         return count;
     }
 
@@ -293,11 +293,11 @@ public class RedisCacheWarmupService {
      * Called when a new job is launched after startup.
      * Uses the DAO instead of raw SQL for type safety and maintainability.
      */
-    private void warmupSingleJobMetadata(String jobId) {
+    private void loadSingleJobMetadata(String jobId) {
         JobDetail job = jobDao.getJobDetail(jobId);
 
         if (job == null) {
-            logger.warn("Job {} not found when warming up metadata", jobId);
+            logger.warn("Job {} not found when loading metadata", jobId);
             return;
         }
 
@@ -335,23 +335,23 @@ public class RedisCacheWarmupService {
         jobData.put("maxGpus", String.valueOf(job.maxGpuUnits));
 
         redisTemplate.opsForHash().putAll(jobKey, jobData);
-        logger.debug("Warmed up job metadata for {}", jobId);
+        logger.debug("Loaded job metadata for {}", jobId);
     }
 
     /**
      * Warm up layers for pending jobs (all jobs).
      */
-    private int warmupLayers() {
-        return warmupLayers(null);
+    private int loadLayers() {
+        return loadLayers(null);
     }
 
     /**
-     * Warm up layers - shared implementation for both startup and single-job warmup.
+     * Warm up layers - shared implementation for both startup and single-job load.
      * Uses Redis pipelining to batch layer metadata commands into a single round-trip.
      *
      * @param jobId If null, warms up all pending jobs. If specified, warms up only that job.
      */
-    private int warmupLayers(String jobId) {
+    private int loadLayers(String jobId) {
         String sql = "SELECT l.pk_layer, l.pk_job, l.str_name, l.str_type, l.str_tags, " +
                      "l.str_cmd, l.str_range, l.int_chunk_size, l.str_services, " +
                      "l.int_cores_min, l.int_cores_max, l.int_mem_min, " +
@@ -368,7 +368,7 @@ public class RedisCacheWarmupService {
             : jdbcTemplate.queryForList(sql, jobId);
 
         if (layers.isEmpty()) {
-            logger.debug("No layers to warm up{}", jobId != null ? " for job " + jobId : "");
+            logger.debug("No layers to load{}", jobId != null ? " for job " + jobId : "");
             return 0;
         }
 
@@ -415,17 +415,17 @@ public class RedisCacheWarmupService {
         // Store layer limits (separate loop - requires SQL queries per layer)
         for (Map<String, Object> row : layers) {
             String layerId = (String) row.get("pk_layer");
-            warmupLayerLimits(layerId);
+            loadLayerLimits(layerId);
         }
 
-        logger.debug("Warmed up {} layers{}", layers.size(), jobId != null ? " for job " + jobId : "");
+        logger.debug("Loaded {} layers{}", layers.size(), jobId != null ? " for job " + jobId : "");
         return layers.size();
     }
 
     /**
      * Warm up limits for a specific layer.
      */
-    private void warmupLayerLimits(String layerId) {
+    private void loadLayerLimits(String layerId) {
         String sql = "SELECT ll.pk_limit_record, lr.int_max_value " +
                      "FROM layer_limit ll " +
                      "JOIN limit_record lr ON lr.pk_limit_record = ll.pk_limit_record " +
@@ -445,17 +445,17 @@ public class RedisCacheWarmupService {
     /**
      * Warm up waiting frames (all jobs).
      */
-    private int warmupWaitingFrames() {
-        return warmupWaitingFrames(null);
+    private int loadWaitingFrames() {
+        return loadWaitingFrames(null);
     }
 
     /**
-     * Warm up waiting frames - shared implementation for both startup and single-job warmup.
+     * Warm up waiting frames - shared implementation for both startup and single-job load.
      * Uses Redis pipelining to batch all commands into a single round-trip.
      *
      * @param jobId If null, warms up all pending jobs. If specified, warms up only that job.
      */
-    private int warmupWaitingFrames(String jobId) {
+    private int loadWaitingFrames(String jobId) {
         String sql = "SELECT f.pk_frame, f.pk_layer, f.pk_job, f.str_name, " +
                      "f.int_dispatch_order, f.int_layer_order, f.int_retries, f.int_version " +
                      "FROM frame f " +
@@ -469,7 +469,7 @@ public class RedisCacheWarmupService {
             : jdbcTemplate.queryForList(sql, jobId);
 
         if (frames.isEmpty()) {
-            logger.debug("No waiting frames to warm up{}", jobId != null ? " for job " + jobId : "");
+            logger.debug("No waiting frames to load{}", jobId != null ? " for job " + jobId : "");
             return 0;
         }
 
@@ -510,7 +510,7 @@ public class RedisCacheWarmupService {
             }
         });
 
-        logger.debug("Warmed up {} waiting frames{}", frames.size(), jobId != null ? " for job " + jobId : "");
+        logger.debug("Loaded {} waiting frames{}", frames.size(), jobId != null ? " for job " + jobId : "");
         return frames.size();
     }
 
@@ -519,35 +519,35 @@ public class RedisCacheWarmupService {
     }
 
     // ============================================================
-    // SINGLE JOB WARMUP (called when new job is launched)
+    // SINGLE JOB LOADING (called when new job is launched)
     // ============================================================
 
     /**
-     * Warm up Redis cache for a single job.
-     * Called when a new job is launched AFTER the initial startup warmup.
+     * Load Redis cache for a single job.
+     * Called when a new job is launched AFTER the initial startup load.
      *
      * This populates layers and frames for the job so Redis queries work
      * immediately without falling back to SQL.
      *
-     * @param jobId The job ID to warm up
+     * @param jobId The job ID to load
      */
-    public void warmupJob(String jobId) {
+    public void loadJob(String jobId) {
         long startTime = System.currentTimeMillis();
-        logger.info("Warming up Redis cache for job: {}", jobId);
+        logger.info("Loading Redis cache for job: {}", jobId);
 
         try {
             // Populate job metadata hash (needed for building DispatchFrame objects)
-            warmupSingleJobMetadata(jobId);
+            loadSingleJobMetadata(jobId);
             // Use shared methods with jobId filter
-            int layerCount = warmupLayers(jobId);
-            int frameCount = warmupWaitingFrames(jobId);
+            int layerCount = loadLayers(jobId);
+            int frameCount = loadWaitingFrames(jobId);
 
             long duration = System.currentTimeMillis() - startTime;
-            logger.info("Job {} warmed up in {}ms: {} layers, {} frames",
+            logger.info("Job {} loaded in {}ms: {} layers, {} frames",
                     jobId, duration, layerCount, frameCount);
 
         } catch (Exception e) {
-            logger.error("Failed to warm up job {} in Redis", jobId, e);
+            logger.error("Failed to load job {} in Redis", jobId, e);
             // Don't throw - SQL fallback will work
         }
     }
