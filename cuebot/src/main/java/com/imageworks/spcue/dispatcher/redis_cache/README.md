@@ -498,6 +498,362 @@ Key metrics to monitor:
 - Cache hit rate (Redis queries vs SQL fallbacks)
 - Event publishing lag
 
+---
+
+## Corner Cases: Redis/SQL Desynchronization and Failures
+
+This section documents all known corner cases that can cause Redis and SQL to become desynchronized, and how each is handled. **The key guarantee: the worst that can happen is a temporary performance degradation (SQL fallback), never incorrect scheduling or data loss.**
+
+### Design Philosophy
+
+| Principle | Implementation |
+|-----------|----------------|
+| **SQL is always truth** | All writes go to SQL first. Redis is read-only cache. |
+| **Redis failures = SQL fallback** | Any Redis error returns empty, triggering SQL query. |
+| **Self-healing** | Cuebot restart reloads cache from SQL. |
+| **No double-booking** | Frame booking happens in SQL with row locks. |
+
+---
+
+### Category 1: Event Publishing Failures
+
+#### 1.1 Redis Connection Lost During Event Publishing
+
+**Scenario:** Frame becomes WAITING in SQL, but Redis connection is down when event listener tries to add it.
+
+**What happens:**
+```
+SQL: frame.state = WAITING  ✓
+Redis: ZADD frames:waiting:layer1 frame1  ✗ (connection error)
+```
+
+**Impact:** Frame exists in SQL but not in Redis waiting set.
+
+**Recovery:**
+- Redis dispatch returns empty → SQL fallback kicks in
+- Frame gets dispatched via SQL
+- Next cuebot restart reloads correct state
+
+**Worst case:** One frame dispatched via SQL instead of Redis (slower but correct).
+
+---
+
+#### 1.2 Event Lost Due to Async Queue Overflow
+
+**Scenario:** High event volume overwhelms the `@Async("redisAsyncExecutor")` thread pool.
+
+**What happens:**
+```
+FrameStateChangedEvent fired → Executor queue full → Event dropped
+```
+
+**Impact:** Redis misses the state change.
+
+**Recovery:**
+- Same as 1.1: SQL fallback handles it
+- Configuration can increase executor pool size
+
+**Worst case:** Temporary SQL fallback until restart.
+
+---
+
+#### 1.3 Transaction Rollback After Event Queued
+
+**Scenario:** SQL transaction commits, event fires, then something triggers a rollback (rare edge case with nested transactions).
+
+**What happens:**
+```
+SQL: BEGIN → frame.state = WAITING → COMMIT (event fires) → outer ROLLBACK?
+Redis: receives event, adds frame to waiting set
+```
+
+**Impact:** Frame in Redis but not in SQL.
+
+**Recovery:**
+- Redis dispatch returns frame ID → SQL booking check fails (frame doesn't exist)
+- Frame is never actually booked
+- Redis cleanup happens on job completion or restart
+
+**Why this is rare:** `@TransactionalEventListener(AFTER_COMMIT)` only fires after the inner transaction commits. Outer rollbacks are application bugs, not normal operation.
+
+**Worst case:** Redis returns stale frame, SQL booking safely rejects it.
+
+---
+
+### Category 2: Race Conditions
+
+#### 2.1 Frame State Change During Dispatch Query
+
+**Scenario:** Lua script is finding frames while a frame transitions from WAITING to RUNNING.
+
+**Timeline:**
+```
+T0: Lua reads frames:waiting:layer1 → [frame1, frame2]
+T1: Java books frame1, fires event
+T2: Event listener removes frame1 from Redis
+T3: Lua returns [frame1, frame2] to Java
+T4: Java tries to book frame1 → SQL says "already running"
+```
+
+**Impact:** Lua returns a frame that's no longer bookable.
+
+**Recovery:**
+- SQL booking is the source of truth
+- `DispatchSupport.dispatch()` handles "frame already booked" gracefully
+- Java simply skips to next frame
+
+**Worst case:** One wasted booking attempt (microseconds).
+
+---
+
+#### 2.2 Race in `layers:waiting` Cleanup
+
+**Code location:** `RedisSchedulingEventListener.java:117-120`
+
+**Scenario:** Two frames in same layer become non-WAITING simultaneously.
+
+**Timeline:**
+```
+T0: Thread A processes frame1 leaving WAITING
+T1: Thread A checks: ZCARD frames:waiting:layer1 → 1 (frame2 still there)
+T2: Thread B processes frame2 leaving WAITING
+T3: Thread B checks: ZCARD frames:waiting:layer1 → 0
+T4: Thread B removes layer1 from layers:waiting:job1
+T5: Thread A does nothing (saw count=1)
+--- Later ---
+T6: frame3 becomes WAITING in layer1
+T7: SADD layers:waiting:job1 layer1  ← Self-heals!
+```
+
+**Impact:** Momentary inconsistency where `layers:waiting` is missing a layer.
+
+**Recovery:**
+- When any frame becomes WAITING, it does `SADD layers:waiting:jobId layerId`
+- This re-adds the layer immediately
+- See code comment at line 113-116
+
+**Worst case:** One dispatch cycle misses the layer → SQL fallback.
+
+---
+
+#### 2.3 Multiple Cuebots Loading Simultaneously
+
+**Scenario:** Two cuebot instances start at the same time, both try to load cache.
+
+**Protection:** Distributed lock in `RedisCacheLoadService.java:99-123`
+
+```java
+Boolean acquired = redisTemplate.opsForValue()
+    .setIfAbsent(LOAD_LOCK_KEY, instanceId, 5, TimeUnit.MINUTES);
+```
+
+**What happens:**
+- First cuebot acquires lock, loads cache
+- Second cuebot sees lock, skips load (relies on SQL fallback)
+- After 5 minutes, lock auto-expires (safety for crashed loader)
+
+**Worst case:** Second cuebot uses SQL fallback until first completes loading.
+
+---
+
+### Category 3: Data Drift
+
+#### 3.1 Limit Counter Drift
+
+**Scenario:** Frame starts running, limit counter incremented. Frame crashes without proper completion event.
+
+**What happens:**
+```
+T0: Frame starts → limit:render:running = 10
+T1: RQD crashes, frame orphaned
+T2: FrameCompleteHandler never called
+T3: limit:render:running stuck at 10 (should be 9)
+```
+
+**Impact:** Limit appears more used than it is → fewer frames dispatched than allowed.
+
+**Recovery:**
+- Cuebot restart recalculates from SQL: `SUM(layer_stat.int_running_count)`
+- Orphan detection eventually marks frame as DEAD, triggering proper completion
+
+**Worst case:** Slightly reduced throughput until restart or orphan cleanup.
+
+---
+
+#### 3.2 Limit Counter Goes Negative
+
+**Scenario:** Decrement event processed twice, or processed for frame that was never incremented.
+
+**Protection:** `RedisSchedulingEventListener.java:165-170`
+
+```java
+if (newCount != null && newCount < 0) {
+    redisTemplate.opsForValue().set(runningKey, "0");
+    logger.warn("Limit {} running count went negative, reset to 0", limitId);
+}
+```
+
+**Impact:** None - immediately corrected.
+
+**Worst case:** Log warning, counter reset to 0.
+
+---
+
+#### 3.3 Job Metadata Stale After Pause/Unpause
+
+**Scenario:** Job is paused in SQL, but job metadata hash in Redis still shows `paused=false`.
+
+**Why this doesn't matter:**
+- Job FINDING happens in SQL, not Redis
+- SQL query filters: `WHERE j.b_paused = false`
+- Paused job never reaches Redis dispatch code
+
+**Impact:** None - Redis job metadata only used for building DispatchFrame objects.
+
+---
+
+#### 3.4 Layer Resource Requirements Changed
+
+**Scenario:** Admin changes layer minCores from 4 to 8, event doesn't fire or is lost.
+
+**What happens:**
+```
+SQL: layer.int_cores_min = 8
+Redis: layer:abc123 → {minCores: 4}  (stale)
+```
+
+**Impact:** Redis might return frames that don't fit host.
+
+**Recovery:**
+- SQL booking validates resources again
+- Frame booking fails if host doesn't have 8 cores
+- Admin can restart cuebot or wait for job completion
+
+**Worst case:** Wasted dispatch attempts until restart.
+
+---
+
+### Category 4: Complete Failures
+
+#### 4.1 Redis Completely Unavailable
+
+**Scenario:** Redis server is down.
+
+**What happens:**
+```java
+// RedisDispatchSupport.java:74
+if (redisDispatchCache.hasJobData(job.getJobId())) {
+    // This throws or returns false
+}
+// Falls through to SQL fallback at line 89
+return sqlDispatcherDao.findNextDispatchFrames(job, host, limit);
+```
+
+**Impact:** All dispatch queries go to SQL.
+
+**Worst case:** System operates at SQL performance levels (still functional).
+
+---
+
+#### 4.2 Redis Data Corruption
+
+**Scenario:** Redis data becomes corrupted (memory error, bad restore, etc.).
+
+**What happens:**
+- Lua scripts may error or return garbage
+- `RedisDispatchSupport` catches exceptions, falls back to SQL
+
+**Recovery:**
+- Cuebot restart does `clearSchedulingData()` then full reload
+- Or admin can manually `FLUSHDB` and restart
+
+**Worst case:** SQL fallback until restart.
+
+---
+
+#### 4.3 Startup Load Fails Partway
+
+**Scenario:** Loading 100k frames, Redis connection drops at 50k.
+
+**What happens:**
+```
+Limits loaded ✓
+Jobs loaded ✓
+Layers loaded ✓
+Frames: 50k loaded, then error
+```
+
+**Impact:** Half the frames in Redis, half missing.
+
+**Recovery:**
+- Missing frames → empty Redis result → SQL fallback
+- Next restart does full reload
+
+**Worst case:** 50% of dispatches use SQL until restart.
+
+---
+
+### Category 5: Timing Windows
+
+#### 5.1 New Job Launch Before Load Complete
+
+**Scenario:** Job launched while another cuebot is still doing startup load.
+
+**What happens:**
+```
+CuebotA: Acquiring load lock... (loading 500k frames)
+CuebotB: Lock taken, skipping load
+User: Launches new job on CuebotB
+CuebotB: loadJob("newjob123") ← Works fine!
+```
+
+**Why it works:** `loadJob()` doesn't need the load lock. It only loads data for one job.
+
+**Impact:** None.
+
+---
+
+#### 5.2 Frame Becomes WAITING During Cache Load
+
+**Scenario:** Cache load reads WAITING frames at T0. At T1, dependency satisfies, frame becomes WAITING.
+
+**Timeline:**
+```
+T0: loadWaitingFrames() queries SQL → doesn't see frame1 (was DEPEND)
+T1: DependManager satisfies depend → frame1 DEPEND→WAITING
+T2: Event fires, listener adds frame1 to Redis
+T3: loadWaitingFrames() completes
+```
+
+**Impact:** None - event system handles the new frame.
+
+**Why it works:** Events use `@TransactionalEventListener(AFTER_COMMIT)`, which fires regardless of load state.
+
+---
+
+### Summary: Failure Mode Matrix
+
+| Failure | Impact | Detection | Recovery Time |
+|---------|--------|-----------|---------------|
+| Redis connection lost | SQL fallback | Automatic | Immediate |
+| Event dropped | Single frame via SQL | Logs | Next restart |
+| Race in waiting set | One cycle SQL fallback | None needed | Self-healing |
+| Limit counter drift | Reduced throughput | Monitor metrics | Restart or orphan cleanup |
+| Stale layer metadata | Wasted booking attempts | Logs | Restart |
+| Redis down | Full SQL fallback | Health check | When Redis returns |
+| Partial load | Partial SQL fallback | Logs | Restart |
+
+### Key Guarantees
+
+1. **No incorrect scheduling:** SQL booking is always the gatekeeper
+2. **No data loss:** SQL is source of truth
+3. **No double-booking:** SQL row locks prevent races
+4. **Graceful degradation:** Every failure falls back to SQL
+5. **Self-healing:** Restart always fixes desync
+6. **No manual intervention required:** All recovery is automatic
+
+---
+
 ## Summary
 
 The Redis scheduling cache provides:
