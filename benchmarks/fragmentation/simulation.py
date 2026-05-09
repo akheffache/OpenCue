@@ -211,14 +211,21 @@ def run_simulation(
             logger.info(f"Starting DB load simulator ({db_load_qps} QPS)")
             db_load_simulator.start()
 
+        # Start timing
+        metrics_collector.start_timing(job_names)
+
         # Send host reports to trigger dispatch
         for dispatch_round in range(5):
             logger.info(f"Dispatch round {dispatch_round + 1}")
             host_simulator.send_host_reports()
+            metrics_collector.record_dispatch_round()
             time.sleep(1)
 
         # Wait for dispatch to settle
         wait_for_dispatch_to_settle(job_names)
+
+        # Stop timing
+        timing_stats = metrics_collector.stop_timing(job_names)
 
         # Stop DB load simulator and get stats
         db_load_stats = None
@@ -232,6 +239,9 @@ def run_simulation(
 
         report = metrics_collector.generate_report(job_names)
         metrics_collector.print_report(report)
+
+        # Print timing stats
+        metrics_collector.print_timing_stats(timing_stats)
 
         # Print DB load stats if enabled
         if db_load_stats:
