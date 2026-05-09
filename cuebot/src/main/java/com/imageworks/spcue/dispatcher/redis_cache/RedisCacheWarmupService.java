@@ -29,7 +29,10 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.RedisOperations;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.SessionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -344,6 +347,8 @@ public class RedisCacheWarmupService {
 
     /**
      * Warm up layers - shared implementation for both startup and single-job warmup.
+     * Uses Redis pipelining to batch layer metadata commands into a single round-trip.
+     *
      * @param jobId If null, warms up all pending jobs. If specified, warms up only that job.
      */
     private int warmupLayers(String jobId) {
@@ -362,52 +367,59 @@ public class RedisCacheWarmupService {
             ? jdbcTemplate.queryForList(sql)
             : jdbcTemplate.queryForList(sql, jobId);
 
-        int count = 0;
+        if (layers.isEmpty()) {
+            logger.debug("No layers to warm up{}", jobId != null ? " for job " + jobId : "");
+            return 0;
+        }
+
+        // Use pipelining to batch all Redis commands into a single round-trip
+        redisTemplate.executePipelined(new SessionCallback<Object>() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public Object execute(RedisOperations operations) throws DataAccessException {
+                for (Map<String, Object> row : layers) {
+                    String layerId = (String) row.get("pk_layer");
+                    String layerJobId = (String) row.get("pk_job");
+                    int waitingCount = ((Number) row.get("int_waiting_count")).intValue();
+
+                    // Store layer metadata
+                    String layerKey = LAYER_PREFIX + layerId;
+                    Map<String, String> layerData = new HashMap<>();
+                    layerData.put("jobId", layerJobId);
+                    layerData.put("name", (String) row.get("str_name"));
+                    layerData.put("type", (String) row.get("str_type"));
+                    layerData.put("tags", nullToEmpty(row.get("str_tags")));
+                    layerData.put("command", nullToEmpty(row.get("str_cmd")));
+                    layerData.put("range", nullToEmpty(row.get("str_range")));
+                    layerData.put("chunkSize", String.valueOf(row.get("int_chunk_size")));
+                    layerData.put("services", nullToEmpty(row.get("str_services")));
+                    layerData.put("minCores", String.valueOf(row.get("int_cores_min")));
+                    layerData.put("maxCores", String.valueOf(row.get("int_cores_max")));
+                    layerData.put("minMemory", String.valueOf(row.get("int_mem_min")));
+                    layerData.put("minGpus", String.valueOf(row.get("int_gpus_min")));
+                    layerData.put("maxGpus", String.valueOf(row.get("int_gpus_max")));
+                    layerData.put("minGpuMemory", String.valueOf(row.get("int_gpu_mem_min")));
+                    layerData.put("threadable", String.valueOf(row.get("b_threadable")));
+
+                    operations.opsForHash().putAll(layerKey, layerData);
+
+                    // Track layers with waiting frames
+                    if (waitingCount > 0) {
+                        operations.opsForSet().add(LAYERS_WAITING_PREFIX + layerJobId, layerId);
+                    }
+                }
+                return null;
+            }
+        });
+
+        // Store layer limits (separate loop - requires SQL queries per layer)
         for (Map<String, Object> row : layers) {
-            processLayerRow(row);
-            count++;
+            String layerId = (String) row.get("pk_layer");
+            warmupLayerLimits(layerId);
         }
 
-        logger.debug("Warmed up {} layers{}", count, jobId != null ? " for job " + jobId : "");
-        return count;
-    }
-
-    /**
-     * Process a single layer row from SQL and store in Redis.
-     */
-    private void processLayerRow(Map<String, Object> row) {
-        String layerId = (String) row.get("pk_layer");
-        String jobId = (String) row.get("pk_job");
-        int waitingCount = ((Number) row.get("int_waiting_count")).intValue();
-
-        // Store layer metadata
-        String layerKey = LAYER_PREFIX + layerId;
-        Map<String, String> layerData = new HashMap<>();
-        layerData.put("jobId", jobId);
-        layerData.put("name", (String) row.get("str_name"));
-        layerData.put("type", (String) row.get("str_type"));
-        layerData.put("tags", nullToEmpty(row.get("str_tags")));
-        layerData.put("command", nullToEmpty(row.get("str_cmd")));
-        layerData.put("range", nullToEmpty(row.get("str_range")));
-        layerData.put("chunkSize", String.valueOf(row.get("int_chunk_size")));
-        layerData.put("services", nullToEmpty(row.get("str_services")));
-        layerData.put("minCores", String.valueOf(row.get("int_cores_min")));
-        layerData.put("maxCores", String.valueOf(row.get("int_cores_max")));
-        layerData.put("minMemory", String.valueOf(row.get("int_mem_min")));
-        layerData.put("minGpus", String.valueOf(row.get("int_gpus_min")));
-        layerData.put("maxGpus", String.valueOf(row.get("int_gpus_max")));
-        layerData.put("minGpuMemory", String.valueOf(row.get("int_gpu_mem_min")));
-        layerData.put("threadable", String.valueOf(row.get("b_threadable")));
-
-        redisTemplate.opsForHash().putAll(layerKey, layerData);
-
-        // Track layers with waiting frames
-        if (waitingCount > 0) {
-            redisTemplate.opsForSet().add(LAYERS_WAITING_PREFIX + jobId, layerId);
-        }
-
-        // Store layer limits
-        warmupLayerLimits(layerId);
+        logger.debug("Warmed up {} layers{}", layers.size(), jobId != null ? " for job " + jobId : "");
+        return layers.size();
     }
 
     /**
@@ -439,6 +451,8 @@ public class RedisCacheWarmupService {
 
     /**
      * Warm up waiting frames - shared implementation for both startup and single-job warmup.
+     * Uses Redis pipelining to batch all commands into a single round-trip.
+     *
      * @param jobId If null, warms up all pending jobs. If specified, warms up only that job.
      */
     private int warmupWaitingFrames(String jobId) {
@@ -454,48 +468,50 @@ public class RedisCacheWarmupService {
             ? jdbcTemplate.queryForList(sql)
             : jdbcTemplate.queryForList(sql, jobId);
 
-        int count = 0;
-        for (Map<String, Object> row : frames) {
-            processFrameRow(row);
-            count++;
+        if (frames.isEmpty()) {
+            logger.debug("No waiting frames to warm up{}", jobId != null ? " for job " + jobId : "");
+            return 0;
         }
 
-        logger.debug("Warmed up {} waiting frames{}", count, jobId != null ? " for job " + jobId : "");
-        return count;
-    }
+        // Use pipelining to batch all Redis commands into a single round-trip
+        redisTemplate.executePipelined(new SessionCallback<Object>() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public Object execute(RedisOperations operations) throws DataAccessException {
+                for (Map<String, Object> row : frames) {
+                    String frameId = (String) row.get("pk_frame");
+                    String layerId = (String) row.get("pk_layer");
+                    String frameJobId = (String) row.get("pk_job");
+                    int dispatchOrder = ((Number) row.get("int_dispatch_order")).intValue();
+                    int layerOrder = ((Number) row.get("int_layer_order")).intValue();
 
-    /**
-     * Process a single frame row from SQL and store in Redis.
-     */
-    private void processFrameRow(Map<String, Object> row) {
-        String frameId = (String) row.get("pk_frame");
-        String layerId = (String) row.get("pk_layer");
-        String jobId = (String) row.get("pk_job");
-        int dispatchOrder = ((Number) row.get("int_dispatch_order")).intValue();
-        int layerOrder = ((Number) row.get("int_layer_order")).intValue();
+                    // Calculate sort score (same as event listener and SQL ORDER BY)
+                    double sortScore = dispatchOrder + (layerOrder / 1000000.0);
 
-        // Calculate sort score (same as event listener and SQL ORDER BY)
-        // SQL: ORDER BY frame.int_dispatch_order ASC, frame.int_layer_order ASC
-        // dispatchOrder is primary, layerOrder is secondary (tiebreaker)
-        double sortScore = dispatchOrder + (layerOrder / 1000000.0);
+                    // Add to waiting frames sorted set
+                    String waitingKey = FRAMES_WAITING_PREFIX + layerId;
+                    operations.opsForZSet().add(waitingKey, frameId, sortScore);
 
-        // Add to waiting frames sorted set
-        String waitingKey = FRAMES_WAITING_PREFIX + layerId;
-        redisTemplate.opsForZSet().add(waitingKey, frameId, sortScore);
+                    // Store frame metadata
+                    String frameKey = FRAME_PREFIX + frameId;
+                    Map<String, String> frameData = new HashMap<>();
+                    frameData.put("layerId", layerId);
+                    frameData.put("jobId", frameJobId);
+                    frameData.put("state", "WAITING");
+                    frameData.put("dispatchOrder", String.valueOf(dispatchOrder));
+                    frameData.put("layerOrder", String.valueOf(layerOrder));
+                    frameData.put("name", nullToEmpty(row.get("str_name")));
+                    frameData.put("retries", String.valueOf(row.get("int_retries")));
+                    frameData.put("version", String.valueOf(row.get("int_version")));
 
-        // Store frame metadata
-        String frameKey = FRAME_PREFIX + frameId;
-        Map<String, String> frameData = new HashMap<>();
-        frameData.put("layerId", layerId);
-        frameData.put("jobId", jobId);
-        frameData.put("state", "WAITING");
-        frameData.put("dispatchOrder", String.valueOf(dispatchOrder));
-        frameData.put("layerOrder", String.valueOf(layerOrder));
-        frameData.put("name", nullToEmpty(row.get("str_name")));
-        frameData.put("retries", String.valueOf(row.get("int_retries")));
-        frameData.put("version", String.valueOf(row.get("int_version")));
+                    operations.opsForHash().putAll(frameKey, frameData);
+                }
+                return null;
+            }
+        });
 
-        redisTemplate.opsForHash().putAll(frameKey, frameData);
+        logger.debug("Warmed up {} waiting frames{}", frames.size(), jobId != null ? " for job " + jobId : "");
+        return frames.size();
     }
 
     private String nullToEmpty(Object value) {
