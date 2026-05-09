@@ -20,6 +20,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import javax.annotation.PostConstruct;
 
@@ -64,6 +66,13 @@ public class RedisCacheWarmupService {
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
+    // Distributed lock for warmup (prevents concurrent warmup from multiple cuebots)
+    private static final String WARMUP_LOCK_KEY = "cuebot:warmup:lock";
+    private static final long WARMUP_LOCK_TIMEOUT_MINUTES = 5;
+
+    // Unique instance ID for lock ownership
+    private final String instanceId = UUID.randomUUID().toString();
+
     @Autowired
     public RedisCacheWarmupService(RedisTemplate<String, String> redisTemplate,
                                     JdbcTemplate jdbcTemplate,
@@ -76,11 +85,35 @@ public class RedisCacheWarmupService {
     /**
      * Warm up Redis cache at application startup.
      * Runs SYNCHRONOUSLY - application won't accept requests until complete.
+     *
+     * Uses a distributed lock to prevent concurrent warmup from multiple cuebots.
+     * If another instance is already warming up, this instance skips warmup
+     * (the other instance will populate Redis, and we have SQL fallback).
      */
     @PostConstruct
     public void init() {
-        logger.info("Starting synchronous Redis cache warm-up...");
-        warmupCache();
+        logger.info("Attempting to acquire warmup lock (instance: {})...", instanceId);
+
+        Boolean acquired = redisTemplate.opsForValue()
+                .setIfAbsent(WARMUP_LOCK_KEY, instanceId, WARMUP_LOCK_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+
+        if (Boolean.TRUE.equals(acquired)) {
+            logger.info("Warmup lock acquired, starting Redis cache warm-up...");
+            try {
+                warmupCache();
+            } finally {
+                // Only release if we still own the lock (could have expired)
+                String currentOwner = redisTemplate.opsForValue().get(WARMUP_LOCK_KEY);
+                if (instanceId.equals(currentOwner)) {
+                    redisTemplate.delete(WARMUP_LOCK_KEY);
+                    logger.info("Warmup lock released");
+                } else {
+                    logger.warn("Warmup lock expired or was taken by another instance");
+                }
+            }
+        } else {
+            logger.info("Another cuebot instance is warming up Redis, skipping (SQL fallback available)");
+        }
     }
 
     /**
