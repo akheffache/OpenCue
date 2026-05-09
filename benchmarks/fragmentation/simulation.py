@@ -9,7 +9,7 @@ This simulation measures fragmentation in OpenCue's scheduling by:
 4. Measuring resulting fragmentation
 
 Usage:
-    python simulation.py [--cuebot HOST:PORT] [--utilization 0.2]
+    python simulation.py [--cuebot HOST:PORT] [--utilization 0.2] [--db-load-qps 10]
 """
 
 import argparse
@@ -27,6 +27,7 @@ from opencue.cuebot import Cuebot
 from host_simulator import HostSimulator
 from job_generator import JobGenerator
 from metrics import MetricsCollector
+from db_load_simulator import DBLoadSimulator
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,9 @@ PRIORITIES_CONFIG = [10, 30, 50, 70, 90]
 
 # Default target utilization
 DEFAULT_TARGET_UTILIZATION = 0.20
+
+# Default DB load (queries per second)
+DEFAULT_DB_LOAD_QPS = 10.0
 
 # =============================================================================
 
@@ -134,6 +138,7 @@ def run_simulation(
     show_name: str = "benchmark",
     facility_name: str = "local",
     skip_host_registration: bool = False,
+    db_load_qps: float = DEFAULT_DB_LOAD_QPS,
 ) -> None:
     """Run the fragmentation simulation."""
 
@@ -154,6 +159,7 @@ def run_simulation(
         priorities=PRIORITIES_CONFIG,
     )
     metrics_collector = MetricsCollector()
+    db_load_simulator = DBLoadSimulator(queries_per_second=db_load_qps) if db_load_qps > 0 else None
 
     try:
         # Phase 1: Create simulated hosts
@@ -195,10 +201,15 @@ def run_simulation(
             logger.error("No jobs created, aborting")
             return
 
-        # Phase 3: Dispatch loop
+        # Phase 3: Dispatch loop (with DB load simulation)
         logger.info("=" * 50)
         logger.info("PHASE 3: Dispatch Loop")
         logger.info("=" * 50)
+
+        # Start background DB load simulator
+        if db_load_simulator:
+            logger.info(f"Starting DB load simulator ({db_load_qps} QPS)")
+            db_load_simulator.start()
 
         # Send host reports to trigger dispatch
         for dispatch_round in range(5):
@@ -209,6 +220,11 @@ def run_simulation(
         # Wait for dispatch to settle
         wait_for_dispatch_to_settle(job_names)
 
+        # Stop DB load simulator and get stats
+        db_load_stats = None
+        if db_load_simulator:
+            db_load_stats = db_load_simulator.stop()
+
         # Phase 4: Collect and report metrics
         logger.info("=" * 50)
         logger.info("PHASE 4: Results")
@@ -216,6 +232,10 @@ def run_simulation(
 
         report = metrics_collector.generate_report(job_names)
         metrics_collector.print_report(report)
+
+        # Print DB load stats if enabled
+        if db_load_stats:
+            db_load_simulator.print_stats(db_load_stats)
 
         # Summary
         print("\n" + "=" * 70)
@@ -227,6 +247,8 @@ def run_simulation(
         print(f"Actual Utilization:   {report.core_utilization_percent:.1f}%")
         print(f"Fragmented Cores:     {report.fragmented_cores:.0f}")
         print(f"Fragmentation Rate:   {report.effective_fragmentation_percent:.1f}%")
+        if db_load_stats:
+            print(f"DB Load (actual QPS): {db_load_stats.queries_per_second:.1f}")
         print("=" * 70)
 
     except KeyboardInterrupt:
@@ -234,6 +256,8 @@ def run_simulation(
     finally:
         # Cleanup
         logger.info("Cleaning up...")
+        if db_load_simulator:
+            db_load_simulator.stop()
         host_simulator.close()
 
         # Optionally cleanup jobs (commented out to allow inspection)
@@ -271,6 +295,12 @@ def main():
         help="Skip host registration (use existing hosts)",
     )
     parser.add_argument(
+        "--db-load-qps",
+        type=float,
+        default=DEFAULT_DB_LOAD_QPS,
+        help=f"Background DB query load in queries/sec (default: {DEFAULT_DB_LOAD_QPS}, 0 to disable)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -301,6 +331,7 @@ def main():
         show_name=args.show,
         facility_name=args.facility,
         skip_host_registration=args.skip_host_registration,
+        db_load_qps=args.db_load_qps,
     )
 
 
