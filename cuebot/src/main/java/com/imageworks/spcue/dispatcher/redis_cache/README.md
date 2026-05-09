@@ -513,6 +513,43 @@ The implementation is **simple and focused**: only frame dispatch queries use Re
 
 ---
 
+## Scheduling Flexibility
+
+Beyond performance, the Redis cache enables **scheduling algorithm improvements** that would be difficult or impossible with SQL.
+
+### Why SQL Limits Scheduling Flexibility
+
+SQL's `ORDER BY priority, dispatch_order LIMIT N` is rigid:
+- Returns frames in fixed order
+- No awareness of host resources during selection
+- Can't adapt based on what's already been selected
+- Complex algorithms require multiple round-trips or stored procedures
+
+### What Redis + Lua Enables
+
+Lua scripts execute **server-side with full programmatic control**:
+
+| Capability | SQL | Redis + Lua |
+|------------|-----|-------------|
+| Resource-aware selection | ❌ Returns N frames, hopes some fit | ✅ Tracks remaining resources as frames selected |
+| Best-fit matching | ❌ Would require complex subqueries | ✅ Can score frames by resource fit |
+| Priority-bounded optimization | ❌ Strict priority ordering only | ✅ Can optimize within priority bands |
+| Stochastic sampling | ❌ Not possible | ✅ Can randomly sample from large candidate sets |
+| Layer affinity | ❌ No state between queries | ✅ Can prefer recently-used layers |
+
+### Future Algorithm Possibilities
+
+With Redis, we could implement:
+
+1. **Best-fit dispatch** - Match small frames to small resource slots, save large hosts for large frames
+2. **Priority-bounded best-fit** - Optimize resource usage within the same priority level
+3. **Layer affinity** - Reduce cache thrashing by preferring frames from recently-run layers
+4. **Weighted sampling** - For jobs with 200+ layers, sample proportionally by priority instead of scanning all
+
+These algorithms can be developed and tested by modifying Lua scripts alone, without changing Java code or SQL schemas.
+
+---
+
 ## Annex A: How Dependencies Work
 
 Frame dependencies are **transparent to Redis** because they're handled via state transitions:
