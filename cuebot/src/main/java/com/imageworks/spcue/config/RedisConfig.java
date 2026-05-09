@@ -110,21 +110,31 @@ public class RedisConfig {
     }
 
     /**
-     * Thread pool executor for async Redis event handling.
-     * This ensures Redis sync operations don't block the main dispatch thread.
+     * Single-threaded executor for async Redis event handling.
+     *
+     * WHY SINGLE-THREADED: Events for the same frame must be processed in order.
+     * With multiple threads, a frame retry sequence (WAITING→RUNNING→WAITING→RUNNING)
+     * could be processed out of order, leaving Redis with stale state. A single thread
+     * guarantees FIFO ordering. Redis writes are ~10x faster than SQL, so this is not
+     * a bottleneck.
+     *
+     * FUTURE: If throughput becomes an issue, use a keyed executor that routes events
+     * by frameId hash (frameId.hashCode() % numThreads) to guarantee per-frame ordering
+     * while allowing parallelism across different frames.
      */
     @Bean(name = "redisAsyncExecutor")
     public Executor redisAsyncExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(4);
-        executor.setMaxPoolSize(16);
+        // Single thread to guarantee event ordering (see comment above)
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
         executor.setQueueCapacity(1000);
         executor.setThreadNamePrefix("redis-sync-");
         // CallerRunsPolicy ensures no events are dropped - if queue is full,
         // the task runs in the caller's thread, maintaining SQL/Redis sync
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
         executor.initialize();
-        logger.info("Redis async executor initialized with {} core threads", executor.getCorePoolSize());
+        logger.info("Redis async executor initialized (single-threaded for event ordering)");
         return executor;
     }
 }
