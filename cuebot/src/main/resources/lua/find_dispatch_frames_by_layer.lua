@@ -76,29 +76,47 @@ local function tagsMatch(layerTagsKey, hostTagSet)
     return false  -- No matching tag found
 end
 
--- Helper function to check if layer limits allow dispatch
--- Returns true if all limits have capacity, false if any limit is maxed out
-local function checkLayerLimits()
+-- Compute the minimum remaining capacity across all limits attached to this
+-- layer. Returns:
+--   * math.huge if the layer has no limits or all limits are uncapped
+--   * 0 if any attached limit is fully saturated
+--   * otherwise the tightest remaining slot count across attached limits
+-- This is the maximum number of additional frames the limits will allow
+-- this layer to dispatch right now.
+local function getLayerLimitCapacity()
     local limitIds = redis.call('SMEMBERS', layerLimitsKey)
 
     if #limitIds == 0 then
-        return true -- No limits = always allowed
+        return math.huge
     end
+
+    local minCapacity = math.huge
 
     for _, limitId in ipairs(limitIds) do
         local limitKey = 'limit:' .. limitId
-        local runningKey = 'limit:' .. limitId .. ':running'
+        local runningKey = limitKey .. ':running'
 
         local maxValue = tonumber(redis.call('HGET', limitKey, 'maxValue') or 0)
         local running = tonumber(redis.call('GET', runningKey) or 0)
 
-        if maxValue > 0 and running >= maxValue then
-            -- Limit is maxed out - cannot dispatch to this layer
-            return false
+        local cap
+        if maxValue <= 0 then
+            cap = math.huge
+        else
+            cap = maxValue - running
+            if cap < 0 then cap = 0 end
+        end
+
+        if cap < minCapacity then
+            minCapacity = cap
+        end
+
+        if minCapacity <= 0 then
+            return 0
         end
     end
 
-    return true -- All limits have capacity
+    return minCapacity
 end
 
 -- Get layer data
@@ -160,11 +178,6 @@ if resourcesMatch and not tagsMatch(layerTagsKey, hostTagSet) then
     resourcesMatch = false
 end
 
--- Check layer limits - CRITICAL for 1-to-1 SQL parity
-if resourcesMatch and not checkLayerLimits() then
-    resourcesMatch = false
-end
-
 -- If layer doesn't match, return empty
 if not resourcesMatch then
     return {}
@@ -207,6 +220,14 @@ if noGpu == 0 then
             maxByResources = maxByGpuMem
         end
     end
+end
+
+-- P0 #1: Cap by remaining limit capacity. Previously this was a yes/no gate
+-- (any capacity? then dispatch up to maxByResources), which over-dispatched
+-- when remaining limit capacity was smaller than what the host could fit.
+local limitCapacity = getLayerLimitCapacity()
+if limitCapacity ~= math.huge and limitCapacity < maxByResources then
+    maxByResources = limitCapacity
 end
 
 -- Ensure at least 0

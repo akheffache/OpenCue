@@ -50,6 +50,13 @@ local remainingMemory = hostMemory
 local remainingGpus = hostGpus
 local remainingGpuMemory = hostGpuMemory
 
+-- Per-script cache of remaining capacity for each limit encountered.
+-- Key: limitId, Value: remaining slots (math.huge means "unlimited / no cap").
+-- Populated lazily on first encounter (single HGET + GET per limit), then
+-- decremented locally as we book frames against layers that share the limit.
+-- This is what makes the limit cap correct ACROSS layers within one dispatch.
+local limitCapacityCache = {}
+
 -- Helper function to check if host tags satisfy layer's required tags.
 -- Layer tags are stored as a SET in Redis (layer:{id}:tags).
 -- Host tags are passed as pre-normalized values from Java.
@@ -72,30 +79,68 @@ local function tagsMatch(layerId, hostTagSet)
     return false  -- No matching tag found
 end
 
--- Helper function to check if layer limits allow dispatch
--- Returns true if all limits have capacity, false if any limit is maxed out
-local function checkLayerLimits(layerId)
+-- Returns the list of limit IDs attached to this layer, plus the minimum
+-- remaining capacity across them (i.e. how many more frames the limits
+-- collectively allow this layer to dispatch RIGHT NOW).
+--   - Returns (limitIds, capacity) where capacity is:
+--       * math.huge if the layer has no limits
+--       * 0 if any attached limit is fully saturated
+--       * otherwise the smallest remaining slot count across attached limits
+-- Capacity is read from limitCapacityCache (so in-flight bookings from
+-- earlier layers in this same script are already accounted for).
+local function getLayerLimitCapacity(layerId)
     local layerLimitsKey = 'layer:limits:' .. layerId
     local limitIds = redis.call('SMEMBERS', layerLimitsKey)
 
     if #limitIds == 0 then
-        return true -- No limits = always allowed
+        return limitIds, math.huge
     end
 
+    local minCapacity = math.huge
+
     for _, limitId in ipairs(limitIds) do
-        local limitKey = 'limit:' .. limitId
-        local runningKey = 'limit:' .. limitId .. ':running'
+        local cap = limitCapacityCache[limitId]
+        if cap == nil then
+            -- First time we see this limit in this script: load and cache it.
+            local limitKey = 'limit:' .. limitId
+            local runningKey = limitKey .. ':running'
+            local maxValue = tonumber(redis.call('HGET', limitKey, 'maxValue') or 0)
+            local running = tonumber(redis.call('GET', runningKey) or 0)
 
-        local maxValue = tonumber(redis.call('HGET', limitKey, 'maxValue') or 0)
-        local running = tonumber(redis.call('GET', runningKey) or 0)
+            if maxValue <= 0 then
+                -- maxValue <= 0 means "no cap" in our model
+                cap = math.huge
+            else
+                cap = maxValue - running
+                if cap < 0 then cap = 0 end
+            end
+            limitCapacityCache[limitId] = cap
+        end
 
-        if maxValue > 0 and running >= maxValue then
-            -- Limit is maxed out - cannot dispatch to this layer
-            return false
+        if cap < minCapacity then
+            minCapacity = cap
+        end
+
+        -- Short-circuit: a single saturated limit makes the layer ineligible
+        if minCapacity <= 0 then
+            return limitIds, 0
         end
     end
 
-    return true -- All limits have capacity
+    return limitIds, minCapacity
+end
+
+-- Decrement the cached capacity of every limit attached to this layer
+-- by `taken` to account for frames we just booked. Limits with infinite
+-- capacity stay infinite.
+local function consumeLayerLimitCapacity(limitIds, taken)
+    if taken <= 0 then return end
+    for _, limitId in ipairs(limitIds) do
+        local cap = limitCapacityCache[limitId]
+        if cap ~= nil and cap ~= math.huge then
+            limitCapacityCache[limitId] = cap - taken
+        end
+    end
 end
 
 -- Get all layer IDs that have waiting frames for this job
@@ -141,11 +186,6 @@ for _, layerId in ipairs(layerIds) do
             eligible = false
         end
 
-        -- Check layer limits - CRITICAL for 1-to-1 SQL parity
-        if eligible and not checkLayerLimits(layerId) then
-            eligible = false
-        end
-
         -- Check if layer could EVER fit on this host (initial resources)
         -- This is a quick filter before we do per-frame checks
         if eligible then
@@ -175,13 +215,19 @@ for _, layerId in ipairs(layerIds) do
         end
 
         if eligible then
+            -- Capture limit IDs but DO NOT compute capacity yet:
+            -- capacity must be re-read at dispatch time so it reflects
+            -- bookings made against earlier layers in this script.
+            local layerLimitIds = redis.call('SMEMBERS', 'layer:limits:' .. layerId)
+
             table.insert(eligibleLayers, {
                 layerId = layerId,
                 dispatchOrder = dispatchOrder,
                 minCores = minCores,
                 minMemory = minMemory,
                 minGpus = minGpus,
-                minGpuMemory = minGpuMemory
+                minGpuMemory = minGpuMemory,
+                limitIds = layerLimitIds
             })
         end
     end
@@ -211,6 +257,39 @@ for _, layer in ipairs(eligibleLayers) do
         end
     end
 
+    -- Compute (and cache) remaining limit capacity for this layer.
+    -- This reflects any frames already booked against shared limits earlier
+    -- in this same script via consumeLayerLimitCapacity().
+    local limitCapacity
+    if #layer.limitIds == 0 then
+        limitCapacity = math.huge
+    else
+        limitCapacity = math.huge
+        for _, limitId in ipairs(layer.limitIds) do
+            local cap = limitCapacityCache[limitId]
+            if cap == nil then
+                local limitKey = 'limit:' .. limitId
+                local maxValue = tonumber(redis.call('HGET', limitKey, 'maxValue') or 0)
+                local running = tonumber(redis.call('GET', limitKey .. ':running') or 0)
+                if maxValue <= 0 then
+                    cap = math.huge
+                else
+                    cap = maxValue - running
+                    if cap < 0 then cap = 0 end
+                end
+                limitCapacityCache[limitId] = cap
+            end
+            if cap < limitCapacity then
+                limitCapacity = cap
+            end
+        end
+    end
+
+    -- Skip this layer entirely if any limit is saturated
+    if limitCapacity <= 0 then
+        goto continue
+    end
+
     -- Calculate how many frames from this layer we can fit
     -- Guard against division by zero (layers with 0 requirements can fit unlimited frames)
     local canFitCores = layer.minCores > 0 and math.floor(remainingCores / layer.minCores) or limit
@@ -226,10 +305,19 @@ for _, layer in ipairs(eligibleLayers) do
         canFit = math.min(canFit, canFitGpuMem)
     end
 
+    -- Cap by remaining limit capacity (P0 #1: limits must constrain canFit,
+    -- not just gate the layer with a yes/no eligibility check).
+    if limitCapacity ~= math.huge and limitCapacity < canFit then
+        canFit = limitCapacity
+    end
+
     -- Don't fetch more frames than we need
     local needed = math.min(canFit, limit - #result)
     if needed <= 0 then
-        break  -- We have enough frames
+        if #result >= limit then
+            break  -- Host is full
+        end
+        goto continue  -- This layer is capped at 0 by limits/resources, try next layer
     end
 
     -- Get frames from this layer (already sorted by layerOrder in sorted set)
@@ -237,6 +325,7 @@ for _, layer in ipairs(eligibleLayers) do
     local frames = redis.call('ZRANGE', framesWaitingKey, 0, needed - 1)
 
     -- Add frames to result and deduct resources
+    local taken = 0
     for _, frameId in ipairs(frames) do
         table.insert(result, frameId)
         remainingCores = remainingCores - layer.minCores
@@ -245,7 +334,12 @@ for _, layer in ipairs(eligibleLayers) do
             remainingGpus = remainingGpus - layer.minGpus
             remainingGpuMemory = remainingGpuMemory - layer.minGpuMemory
         end
+        taken = taken + 1
     end
+
+    -- Decrement cached limit capacity so subsequent layers sharing these
+    -- limits see the correct remaining capacity.
+    consumeLayerLimitCapacity(layer.limitIds, taken)
 
     -- Stop if we have enough frames
     if #result >= limit then
