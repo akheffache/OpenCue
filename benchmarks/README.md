@@ -22,4 +22,3 @@ python simulation.py --help
 - Running CueBot instance
 - Python 3.7+
 - OpenCue Python libraries (`pycue`, `pyoutline`)
-- PyYAML (`pip install pyyaml`)

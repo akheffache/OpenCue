@@ -66,7 +66,6 @@ python simulation.py --cuebot localhost:8443 --show myshow --facility myfacility
 | `--utilization` | 0.20 | Target utilization (0.0-1.0) |
 | `--show` | benchmark | Show name |
 | `--facility` | local | Facility name |
-| `--config-dir` | ./config | Config directory path |
 | `--skip-host-registration` | false | Use existing hosts |
 | `-v, --verbose` | false | Enable debug logging |
 
@@ -109,13 +108,10 @@ ELK:
 ## Architecture
 
 ```
-simulation.py          # Main orchestrator
+simulation.py          # Main orchestrator (config hardcoded)
 ├── host_simulator.py  # BootReport/HostReport via gRPC
 ├── job_generator.py   # Create jobs with priorities
-├── metrics.py         # Query CueBot, calculate fragmentation
-└── config/
-    ├── hosts.yaml     # Host specifications
-    └── frames.yaml    # Frame distribution
+└── metrics.py         # Query CueBot, calculate fragmentation
 ```
 
 ## How It Works
@@ -145,9 +141,7 @@ Queries CueBot for host state and calculates:
 
 | File | Description |
 |------|-------------|
-| `simulation.py` | Main entry point |
+| `simulation.py` | Main entry point (contains hardcoded config) |
 | `host_simulator.py` | Simulates RQD hosts |
 | `job_generator.py` | Creates benchmark jobs |
 | `metrics.py` | Collects and reports metrics |
-| `config/hosts.yaml` | Host configuration |
-| `config/frames.yaml` | Frame distribution config |

@@ -17,9 +17,6 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Any
-
-import yaml
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -33,24 +30,35 @@ from metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# HARDCODED CONFIGURATION - Based on real production data
+# =============================================================================
 
-def load_config(config_dir: Path) -> Dict[str, Any]:
-    """Load configuration from YAML files."""
-    hosts_file = config_dir / "hosts.yaml"
-    frames_file = config_dir / "frames.yaml"
+# Host specifications: 1,553 hosts, 57,248 total cores
+HOSTS_CONFIG = {
+    "elk": {"count": 1004, "cores": 16, "memory_gb": 125, "tags": ["general", "render"]},
+    "ram": {"count": 303, "cores": 32, "memory_gb": 251, "tags": ["general", "render", "midrange"]},
+    "jaime": {"count": 246, "cores": 128, "memory_gb": 503, "tags": ["general", "render", "highend"]},
+}
 
-    with open(hosts_file) as f:
-        hosts_config = yaml.safe_load(f)
+# Frame distribution (power-of-2 cores only)
+FRAME_TYPES_CONFIG = [
+    {"cores": 1, "percent": 22.89, "memory_gb": 0.52},
+    {"cores": 2, "percent": 25.54, "memory_gb": 1.38},
+    {"cores": 4, "percent": 34.22, "memory_gb": 6.44},
+    {"cores": 8, "percent": 14.55, "memory_gb": 27.27},
+    {"cores": 16, "percent": 1.88, "memory_gb": 63.85},
+    {"cores": 32, "percent": 0.28, "memory_gb": 109.00},
+    {"cores": 64, "percent": 0.03, "memory_gb": 233.12},
+]
 
-    with open(frames_file) as f:
-        frames_config = yaml.safe_load(f)
+# Job priority levels
+PRIORITIES_CONFIG = [10, 30, 50, 70, 90]
 
-    return {
-        "hosts": hosts_config["hosts"],
-        "frame_types": frames_config["frame_types"],
-        "priorities": frames_config["priorities"],
-        "target_utilization": frames_config.get("target_utilization", 0.20),
-    }
+# Default target utilization
+DEFAULT_TARGET_UTILIZATION = 0.20
+
+# =============================================================================
 
 
 def setup_show_and_facility(show_name: str, facility_name: str) -> bool:
@@ -122,24 +130,12 @@ def wait_for_dispatch_to_settle(
 def run_simulation(
     cuebot_host: str = "localhost",
     cuebot_port: int = 8443,
-    target_utilization: float = 0.20,
+    target_utilization: float = DEFAULT_TARGET_UTILIZATION,
     show_name: str = "benchmark",
     facility_name: str = "local",
-    config_dir: Path = None,
     skip_host_registration: bool = False,
 ) -> None:
     """Run the fragmentation simulation."""
-
-    # Load configuration
-    if config_dir is None:
-        config_dir = Path(__file__).parent / "config"
-
-    logger.info(f"Loading configuration from {config_dir}")
-    config = load_config(config_dir)
-
-    # Override target utilization if specified
-    if target_utilization != config["target_utilization"]:
-        config["target_utilization"] = target_utilization
 
     # Initialize CueBot connection
     logger.info(f"Connecting to CueBot at {cuebot_host}:{cuebot_port}")
@@ -154,8 +150,8 @@ def run_simulation(
     host_simulator = HostSimulator(cuebot_host, cuebot_port)
     job_generator = JobGenerator(
         show_name=show_name,
-        frame_types=config["frame_types"],
-        priorities=config["priorities"],
+        frame_types=FRAME_TYPES_CONFIG,
+        priorities=PRIORITIES_CONFIG,
     )
     metrics_collector = MetricsCollector()
 
@@ -165,7 +161,7 @@ def run_simulation(
         logger.info("PHASE 1: Host Registration")
         logger.info("=" * 50)
 
-        host_simulator.create_hosts_from_config(config["hosts"], facility=facility_name)
+        host_simulator.create_hosts_from_config(HOSTS_CONFIG, facility=facility_name)
         total_cores = host_simulator.get_total_cores()
         total_memory_gb = host_simulator.get_total_memory_gb()
 
@@ -188,8 +184,8 @@ def run_simulation(
         logger.info("PHASE 2: Job Submission")
         logger.info("=" * 50)
 
-        target_cores = int(total_cores * config["target_utilization"])
-        logger.info(f"Target utilization: {config['target_utilization']*100:.0f}%")
+        target_cores = int(total_cores * target_utilization)
+        logger.info(f"Target utilization: {target_utilization*100:.0f}%")
         logger.info(f"Target cores: {target_cores}")
 
         job_names = job_generator.create_jobs(target_cores)
@@ -225,7 +221,7 @@ def run_simulation(
         print("\n" + "=" * 70)
         print("SIMULATION SUMMARY")
         print("=" * 70)
-        print(f"Target Utilization:   {config['target_utilization']*100:.0f}%")
+        print(f"Target Utilization:   {target_utilization*100:.0f}%")
         print(f"Target Cores:         {target_cores}")
         print(f"Actual Booked Cores:  {report.booked_cores:.0f}")
         print(f"Actual Utilization:   {report.core_utilization_percent:.1f}%")
@@ -256,8 +252,8 @@ def main():
     parser.add_argument(
         "--utilization",
         type=float,
-        default=0.20,
-        help="Target utilization (0.0-1.0, default: 0.20)",
+        default=DEFAULT_TARGET_UTILIZATION,
+        help=f"Target utilization (0.0-1.0, default: {DEFAULT_TARGET_UTILIZATION})",
     )
     parser.add_argument(
         "--show",
@@ -268,12 +264,6 @@ def main():
         "--facility",
         default="local",
         help="Facility name to use (default: local)",
-    )
-    parser.add_argument(
-        "--config-dir",
-        type=Path,
-        default=None,
-        help="Path to config directory (default: ./config)",
     )
     parser.add_argument(
         "--skip-host-registration",
@@ -310,7 +300,6 @@ def main():
         target_utilization=args.utilization,
         show_name=args.show,
         facility_name=args.facility,
-        config_dir=args.config_dir,
         skip_host_registration=args.skip_host_registration,
     )
 
