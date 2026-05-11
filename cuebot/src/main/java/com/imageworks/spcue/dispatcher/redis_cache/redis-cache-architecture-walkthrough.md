@@ -211,8 +211,8 @@ CoreUnitDispatcher.dispatchHost()
    - `findNextDispatchFrames()` executes the Lua script and builds `DispatchFrame` objects.
    - `buildDispatchFramesFromRedis()` constructs full `DispatchFrame` objects from cached Redis hashes (`job:{jobId}`, `layer:{layerId}`, `frame:{frameId}`) with no SQL on the hot path.
 
-6. **[find_dispatch_frames.lua](../../../resources/lua/find_dispatch_frames.lua)** — job-level dispatch.
-7. **[find_dispatch_frames_by_layer.lua](../../../resources/lua/find_dispatch_frames_by_layer.lua)** — layer-targeted dispatch.
+6. **[find_dispatch_frames.lua](../../../../../../resources/lua/find_dispatch_frames.lua)** — job-level dispatch.
+7. **[find_dispatch_frames_by_layer.lua](../../../../../../resources/lua/find_dispatch_frames_by_layer.lua)** — layer-targeted dispatch.
 
 ### Lua Script Logic (find_dispatch_frames.lua)
 
@@ -302,7 +302,7 @@ If you only have a few minutes, read these five call sites in order:
 
 4. **The cache executes the Lua script** → atomic server-side matching.
    [`RedisDispatchCache.java`](RedisDispatchCache.java) (`executeFrameSearch` / `findNextDispatchFrames`) →
-   [`find_dispatch_frames.lua`](../../../resources/lua/find_dispatch_frames.lua) — this is where the O(L log L) algorithm lives. Read this script to understand the actual matching semantics: layer eligibility, `canFit` capacity math, and the per-script `limitCapacityCache` that lets later layers see capacity consumed by earlier ones.
+   [`find_dispatch_frames.lua`](../../../../../../resources/lua/find_dispatch_frames.lua) — this is where the O(L log L) algorithm lives. Read this script to understand the actual matching semantics: layer eligibility, `canFit` capacity math, and the per-script `limitCapacityCache` that lets later layers see capacity consumed by earlier ones.
 
 5. **Cache population at startup / new job** → load orchestration.
    [`RedisCacheLoadService.java#L128`](RedisCacheLoadService.java#L128) — `init()` does `@PostConstruct` lock + bulk load, or [`waitForPeerLoad()`](RedisCacheLoadService.java#L176) if a peer cuebot is loading. [`loadJob(jobId)`](RedisCacheLoadService.java#L637) is the same path when a new job is launched after startup.
