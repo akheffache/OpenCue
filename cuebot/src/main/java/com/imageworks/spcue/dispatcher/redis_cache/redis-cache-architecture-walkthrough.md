@@ -292,7 +292,7 @@ The architecture ensures:
 If you only have a few minutes, read these five call sites in order:
 
 1. **Frame becomes WAITING** → state-change publish at the DAO layer.
-   [`FrameDaoJdbc.java#L79`](../../dao/postgres/FrameDaoJdbc.java#L79) — `publishFrameStateChange()` fires for every state transition; the AFTER_COMMIT listener consumes it.
+   [`FrameDaoJdbc.java#L79`](../../dao/postgres/FrameDaoJdbc.java#L79) — `publishFrameStateChange()` fires for every state transition; the [`AFTER_COMMIT`](RedisSchedulingEventListener.java#L131) listener consumes it.
 
 2. **Sync into Redis** → the listener that maintains the cache.
    [`RedisSchedulingEventListener.java#L132`](RedisSchedulingEventListener.java#L132) — `onFrameStateChanged()` adds/removes from `frames:waiting:{layerId}`, manages `layers:waiting:{jobId}` via atomic Lua cleanup, updates limit running counters.
