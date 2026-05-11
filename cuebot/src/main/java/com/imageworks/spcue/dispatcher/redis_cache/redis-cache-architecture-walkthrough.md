@@ -289,26 +289,20 @@ The architecture ensures:
 
 ## TL;DR — Entry points
 
-If you only have a few minutes, read these four call sites in order:
+If you only have a few minutes, read these five call sites in order:
 
 1. **Frame becomes WAITING** → state-change publish at the DAO layer.
-   `cuebot/src/main/java/com/imageworks/spcue/dao/postgres/FrameDaoJdbc.java:79`
-   `publishFrameStateChange()` — fires for every state transition; the AFTER_COMMIT listener consumes it.
+   [`FrameDaoJdbc.java#L79`](../../dao/postgres/FrameDaoJdbc.java#L79) — `publishFrameStateChange()` fires for every state transition; the AFTER_COMMIT listener consumes it.
 
 2. **Sync into Redis** → the listener that maintains the cache.
-   `cuebot/src/main/java/com/imageworks/spcue/dispatcher/redis_cache/RedisSchedulingEventListener.java:132`
-   `onFrameStateChanged()` — adds/removes from `frames:waiting:{layerId}`, manages `layers:waiting:{jobId}` via atomic Lua cleanup, updates limit running counters.
+   [`RedisSchedulingEventListener.java#L132`](RedisSchedulingEventListener.java#L132) — `onFrameStateChanged()` adds/removes from `frames:waiting:{layerId}`, manages `layers:waiting:{jobId}` via atomic Lua cleanup, updates limit running counters.
 
 3. **Dispatcher asks for frames** → Redis-first dispatch with SQL fallback and readiness gate.
-   `cuebot/src/main/java/com/imageworks/spcue/dispatcher/redis_cache/RedisDispatchSupport.java:73`
-   `findNextDispatchFrames(JobInterface job, DispatchHost host, int limit)` — checks `isReady()`, calls into the cache, falls back to SQL otherwise.
+   [`RedisDispatchSupport.java#L73`](RedisDispatchSupport.java#L73) — `findNextDispatchFrames(JobInterface, DispatchHost, int)` checks `isReady()`, calls into the cache, falls back to SQL otherwise.
 
 4. **The cache executes the Lua script** → atomic server-side matching.
-   `cuebot/src/main/java/com/imageworks/spcue/dispatcher/redis_cache/RedisDispatchCache.java` (`executeFrameSearch` / `findNextDispatchFrames`) →
-   `cuebot/src/main/resources/lua/find_dispatch_frames.lua`
-   This is where the O(L log L) algorithm lives. Read this script to understand the actual matching semantics: layer eligibility, `canFit` capacity math, and the per-script `limitCapacityCache` that lets later layers see capacity consumed by earlier ones.
+   [`RedisDispatchCache.java`](RedisDispatchCache.java) (`executeFrameSearch` / `findNextDispatchFrames`) →
+   [`find_dispatch_frames.lua`](../../../resources/lua/find_dispatch_frames.lua) — this is where the O(L log L) algorithm lives. Read this script to understand the actual matching semantics: layer eligibility, `canFit` capacity math, and the per-script `limitCapacityCache` that lets later layers see capacity consumed by earlier ones.
 
 5. **Cache population at startup / new job** → load orchestration.
-   `cuebot/src/main/java/com/imageworks/spcue/dispatcher/redis_cache/RedisCacheLoadService.java:128`
-   `init()` — `@PostConstruct` lock + bulk load, or `waitForPeerLoad()` if a peer cuebot is loading.
-   `loadJob(jobId)` (line 637) — same path used when a new job is launched after startup.
+   [`RedisCacheLoadService.java#L128`](RedisCacheLoadService.java#L128) — `init()` does `@PostConstruct` lock + bulk load, or [`waitForPeerLoad()`](RedisCacheLoadService.java#L176) if a peer cuebot is loading. [`loadJob(jobId)`](RedisCacheLoadService.java#L637) is the same path when a new job is launched after startup.
