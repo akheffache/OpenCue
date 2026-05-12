@@ -318,8 +318,13 @@ public class HostReportHandler {
                 msg = "The cue has no pending jobs";
             }
 
+            // When the SimpleScheduler is enabled it is the sole dispatch path:
+            // suppress the legacy per-host enqueue here so the two loops do not
+            // race on the same host. SimpleScheduler picks the host up from its
+            // own snapshot query on the next tick.
             boolean bookingOff =
-                    env.getProperty("dispatcher.turn_off_booking", Boolean.class, false);
+                    env.getProperty("dispatcher.turn_off_booking", Boolean.class, false)
+                    || env.getProperty("scheduler.simple.enabled", Boolean.class, false);
             /*
              * If a message was set, the host is not bookable. Log the message and move on.
              */
