@@ -318,8 +318,13 @@ public class HostReportHandler {
                 msg = "The cue has no pending jobs";
             }
 
+            // When the single-thread Scheduler is enabled it owns dispatch:
+            // suppress the legacy per-host BookingQueue enqueue so the two
+            // paths never both run. The Scheduler reaches this host on its
+            // own tick.
             boolean bookingOff =
-                    env.getProperty("dispatcher.turn_off_booking", Boolean.class, false);
+                    env.getProperty("dispatcher.turn_off_booking", Boolean.class, false)
+                    || env.getProperty("scheduler.enabled", Boolean.class, false);
             /*
              * If a message was set, the host is not bookable. Log the message and move on.
              */
