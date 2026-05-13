@@ -235,9 +235,7 @@ public class Scheduler extends JdbcDaoSupport {
                     readLayerCandidatesForGroup(spec, maxIdleInGroup);
             if (candidates.isEmpty()) continue;
 
-            for (BookableHost h : groupHosts) {
-                dispatched += dispatchHostFromCandidates(h, candidates);
-            }
+            dispatched += dispatchGroupWithScoring(groupHosts, candidates);
         }
         return dispatched;
     }
@@ -310,58 +308,106 @@ public class Scheduler extends JdbcDaoSupport {
                      .collect(Collectors.joining(" "));
     }
 
-    // ---- per-host match + dispatch ----------------------------------------
+    // ---- placement: layer-driven, best-fit -------------------------------
 
     /**
-     * Walk the candidate list in priority order, dispatch what fits on this
-     * host, and update in-memory accounting so subsequent hosts in the same
-     * group see the depleted job/show counters. Stops when the host has no
-     * more bookable resources.
+     * Layer-driven placement. For each candidate in priority order:
+     *
+     *   1. Score every fitting host with {@link #placementScore} and pick
+     *      the one with the lowest score (best fit).
+     *   2. Dispatch on that host. {@code dispatcher.dispatchHost(host, layer)}
+     *      books up to {@code job_frame_dispatch_max} frames in one call.
+     *   3. Update in-memory accounting and loop. If the layer still has
+     *      waiting frames AND another host can fit it, dispatch again. This
+     *      preserves deep booking: a high-priority layer with many frames
+     *      drains across all fitting hosts (in best-fit order) before the
+     *      next-priority layer starts.
+     *
+     * Loop exits when the layer has no fitting host, its waiting frame
+     * queue is empty, or its job/show cap is reached.
      */
-    private int dispatchHostFromCandidates(BookableHost h, List<LayerCandidate> candidates) {
+    private int dispatchGroupWithScoring(List<BookableHost> hosts,
+                                         List<LayerCandidate> candidates) {
         int dispatched = 0;
         for (LayerCandidate c : candidates) {
-            if (h.coresIdle < Dispatcher.CORE_POINTS_RESERVED_MIN) break;
-
-            if (!fitsOnHost(c, h)) continue;
-            if (c.jobCoresInUse  + c.layerCoresMin > c.jobMaxCores)   continue;
+            if (c.jobCoresInUse  + c.layerCoresMin > c.jobMaxCores)    continue;
             if (c.showCoresInUse + c.layerCoresMin > c.showBurstCores) continue;
 
-            try {
-                DispatchHost host = hostManager.getDispatchHost(h.hostId);
-                LayerInterface layer = jobManager.getLayer(c.layerId);
-                List<VirtualProc> procs = dispatcher.dispatchHost(host, layer);
-                if (procs.isEmpty()) continue;
-
-                int bookedCores = 0;
-                long bookedMem  = 0;
-                int bookedGpus  = 0;
-                long bookedGpuMem = 0;
-                for (VirtualProc p : procs) {
-                    bookedCores  += p.coresReserved;
-                    bookedMem    += p.memoryReserved;
-                    bookedGpus   += p.gpusReserved;
-                    bookedGpuMem += p.gpuMemoryReserved;
+            while (true) {
+                BookableHost best = null;
+                long bestScore = Long.MAX_VALUE;
+                for (BookableHost h : hosts) {
+                    if (!fitsOnHost(c, h)) continue;
+                    long score = placementScore(h, c);
+                    if (score < bestScore) {
+                        bestScore = score;
+                        best = h;
+                    }
                 }
+                if (best == null) break;     // no host can fit this layer
 
-                // In-memory accounting carries forward to the next host in this group.
-                h.coresIdle   -= bookedCores;
-                h.memIdle     -= bookedMem;
-                h.gpusIdle    -= bookedGpus;
-                h.gpuMemIdle  -= bookedGpuMem;
-                c.jobCoresInUse  += bookedCores;
-                c.showCoresInUse += bookedCores;
+                try {
+                    DispatchHost host = hostManager.getDispatchHost(best.hostId);
+                    LayerInterface layer = jobManager.getLayer(c.layerId);
+                    List<VirtualProc> procs = dispatcher.dispatchHost(host, layer);
+                    if (procs.isEmpty()) break;   // no waiting frames remain
 
-                dispatched += procs.size();
+                    int  bookedCores  = 0;
+                    long bookedMem    = 0;
+                    int  bookedGpus   = 0;
+                    long bookedGpuMem = 0;
+                    for (VirtualProc p : procs) {
+                        bookedCores  += p.coresReserved;
+                        bookedMem    += p.memoryReserved;
+                        bookedGpus   += p.gpusReserved;
+                        bookedGpuMem += p.gpuMemoryReserved;
+                    }
 
-            } catch (RuntimeException e) {
-                // Host vanished, layer completed, frame race lost, etc. Move on;
-                // next tick reconsiders.
-                logger.debug("Scheduler skipped (host=" + h.hostId
-                        + ", layer=" + c.layerId + "): " + e.getMessage());
+                    best.coresIdle   -= bookedCores;
+                    best.memIdle     -= bookedMem;
+                    best.gpusIdle    -= bookedGpus;
+                    best.gpuMemIdle  -= bookedGpuMem;
+                    c.jobCoresInUse  += bookedCores;
+                    c.showCoresInUse += bookedCores;
+
+                    dispatched += procs.size();
+
+                    if (c.jobCoresInUse  + c.layerCoresMin > c.jobMaxCores)    break;
+                    if (c.showCoresInUse + c.layerCoresMin > c.showBurstCores) break;
+
+                } catch (RuntimeException e) {
+                    // Host vanished, layer completed, frame race lost, etc.
+                    // Stop draining this layer this tick; next tick reconsiders.
+                    logger.debug("Scheduler skipped (host=" + best.hostId
+                            + ", layer=" + c.layerId + "): " + e.getMessage());
+                    break;
+                }
             }
         }
         return dispatched;
+    }
+
+    /**
+     * Placement score for a (host, layer) pair. Lower is better. Callers MUST
+     * call {@link #fitsOnHost} first; this function assumes the layer fits.
+     *
+     * Placeholder for E-PVM. Currently:
+     *
+     *     score = host.coresIdle - layer.coresMin
+     *
+     * One-dimensional best-fit on cores: a 4-core layer scores 0 on a
+     * 4-core host and 60 on a 64-core host, so it prefers the 4-core host
+     * and the big host stays whole for a big layer.
+     *
+     * The full E-PVM formula (Verma et al. 2015, originally Amir, Awerbuch,
+     * Barak, Borgstrom &amp; Keren 2000) generalizes this to multi-resource
+     * stranding cost: cores, memory, GPU and GPU memory all contribute,
+     * weighted to penalize placements that leave one dimension unusable
+     * because another is full. Replacing the body of this method is the
+     * only change needed when upgrading to E-PVM.
+     */
+    static long placementScore(BookableHost h, LayerCandidate c) {
+        return (long) h.coresIdle - (long) c.layerCoresMin;
     }
 
     static boolean fitsOnHost(LayerCandidate c, BookableHost h) {
