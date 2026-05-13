@@ -69,6 +69,25 @@ public class Scheduler extends JdbcDaoSupport {
      */
     private static final long SCHEDULER_LOCK_KEY = 0x4F70656E437565L;
 
+    // ---- placementScore: E-PVM weights and unit normalization -------------
+    //
+    // Score units (after normalization):
+    //   cores       in whole cores       (host int_cores_idle is in core points;
+    //                                      100 core points = 1 core)
+    //   memory      in GB                 (host/layer values are in KB)
+    //   GPUs        in count              (no normalization)
+    //   GPU memory  in GB                 (host/layer values are in KB)
+    //
+    // Weights tuned so cores and memory contribute equally; GPUs weighted
+    // higher to discourage placing non-GPU work on GPU-rich hosts.
+    private static final double W_CORES   = 1.0;
+    private static final double W_MEM     = 1.0;
+    private static final double W_GPUS    = 4.0;
+    private static final double W_GPU_MEM = 1.0;
+
+    private static final double CORE_POINTS_PER_CORE = 100.0;
+    private static final double KB_PER_GB            = 1024.0 * 1024.0;
+
     @Autowired
     private Environment env;
 
@@ -335,10 +354,10 @@ public class Scheduler extends JdbcDaoSupport {
 
             while (true) {
                 BookableHost best = null;
-                long bestScore = Long.MAX_VALUE;
+                double bestScore = Double.POSITIVE_INFINITY;
                 for (BookableHost h : hosts) {
                     if (!fitsOnHost(c, h)) continue;
-                    long score = placementScore(h, c);
+                    double score = placementScore(h, c);
                     if (score < bestScore) {
                         bestScore = score;
                         best = h;
@@ -391,23 +410,102 @@ public class Scheduler extends JdbcDaoSupport {
      * Placement score for a (host, layer) pair. Lower is better. Callers MUST
      * call {@link #fitsOnHost} first; this function assumes the layer fits.
      *
-     * Placeholder for E-PVM. Currently:
+     * Multi-resource stranding score (simple E-PVM, after Amir, Awerbuch,
+     * Barak, Borgstrom &amp; Keren 2000; Verma et al. 2015 Borg paper). The
+     * surplus left on a host after placing one frame is NOT directly the
+     * score, because the host will get more frames of the same layer in
+     * subsequent dispatches within the same tick. What is actually wasted
+     * is the surplus that remains AFTER packing the host with as many
+     * frames of this layer as the dispatcher would let in.
      *
-     *     score = host.coresIdle - layer.coresMin
+     * The packing prediction mirrors the dispatcher's per-frame fit
+     * checks in {@code CoreUnitDispatcher.dispatchHost(host, job)},
+     * evaluated for a per-tick total:
      *
-     * One-dimensional best-fit on cores: a 4-core layer scores 0 on a
-     * 4-core host and 60 on a 64-core host, so it prefers the 4-core host
-     * and the big host stays whole for a big layer.
+     *   - physical fit on every dimension
+     *     (host.idle_D &gt;= layer.min_D, in the per-frame loop)
+     *   - job's int_max_cores cap (isJobBookable check)
+     *   - show's subscription int_burst cap (isShowAtOrOverBurst check)
      *
-     * The full E-PVM formula (Verma et al. 2015, originally Amir, Awerbuch,
-     * Barak, Borgstrom &amp; Keren 2000) generalizes this to multi-resource
-     * stranding cost: cores, memory, GPU and GPU memory all contribute,
-     * weighted to penalize placements that leave one dimension unusable
-     * because another is full. Replacing the body of this method is the
-     * only change needed when upgrading to E-PVM.
+     * Per-call caps host_frame_dispatch_max and job_frame_dispatch_max
+     * are intentionally NOT applied: they only bound how many dispatch
+     * CALLS the Scheduler's loop will need, not the per-tick total. The
+     * post-book MEM_RESERVED_MIN floor breaks the current call but allows
+     * the next call to book one more frame, so it does not change the
+     * count materially.
+     *
+     * Algorithm:
+     *
+     *     remaining_D  = h.idle_D - layer.min_D
+     *     maxMore      = min over all caps above of (capacity / layer.min_D)
+     *     stranded_D   = remaining_D - maxMore * layer.min_D
+     *     score        = sum over D of W_D * stranded_D
+     *
+     * Stranded_D is the residual capacity on dimension D after the host
+     * is packed: capacity that this layer cannot consume because some
+     * other dimension or cap exhausted first.
+     *
+     * Effect: hosts whose resource ratio matches the layer score near
+     * zero regardless of absolute size; only hosts with the wrong shape
+     * (excess on some dimension) get penalized. Reservations are the
+     * mechanism that protects big hosts for big layers; best-fit no
+     * longer has to do that by penalizing big-host placements.
+     *
+     * Examples (defaults W_CORES=1, W_MEM=1, W_GPUS=4, W_GPU_MEM=1)
+     * for a 4-core 4GB layer, ignoring job/show caps:
+     *
+     *     host  4 cores   4GB:   maxMore=0     score = 0
+     *     host 64 cores  64GB:   maxMore=15    score = 0    (ratio match)
+     *     host  4 cores  64GB:   maxMore=0     score = 60   (mem stranded)
+     *     host 64 cores 256GB:   maxMore=15    score = 192  (mem stranded)
      */
-    static long placementScore(BookableHost h, LayerCandidate c) {
-        return (long) h.coresIdle - (long) c.layerCoresMin;
+    static double placementScore(BookableHost h, LayerCandidate c) {
+        long remCores  = h.coresIdle  - c.layerCoresMin;
+        long remMem    = h.memIdle    - c.layerMemMin;
+        long remGpus   = h.gpusIdle   - c.layerGpusMin;
+        long remGpuMem = h.gpuMemIdle - c.layerGpuMemMin;
+
+        long maxMore = Long.MAX_VALUE;
+
+        // Physical fit on each dimension.
+        if (c.layerCoresMin  > 0) maxMore = Math.min(maxMore, remCores  / c.layerCoresMin);
+        if (c.layerMemMin    > 0) maxMore = Math.min(maxMore, remMem    / c.layerMemMin);
+        if (c.layerGpusMin   > 0) maxMore = Math.min(maxMore, remGpus   / c.layerGpusMin);
+        if (c.layerGpuMemMin > 0) maxMore = Math.min(maxMore, remGpuMem / c.layerGpuMemMin);
+
+        // Job int_max_cores cap. Mirrors dispatcher.isJobBookable: the job
+        // cannot exceed int_max_cores cumulatively across this tick's
+        // dispatches. c.jobCoresInUse is updated as we dispatch.
+        if (c.layerCoresMin > 0) {
+            long jobRem = (long) c.jobMaxCores - c.jobCoresInUse - c.layerCoresMin;
+            if (jobRem < 0) jobRem = 0;
+            maxMore = Math.min(maxMore, jobRem / c.layerCoresMin);
+        }
+
+        // Show subscription burst. Mirrors dispatcher.isShowAtOrOverBurst:
+        // the show cannot exceed int_burst on this alloc cumulatively
+        // across this tick's dispatches.
+        if (c.layerCoresMin > 0) {
+            long showRem = (long) c.showBurstCores - c.showCoresInUse - c.layerCoresMin;
+            if (showRem < 0) showRem = 0;
+            maxMore = Math.min(maxMore, showRem / c.layerCoresMin);
+        }
+
+        if (maxMore == Long.MAX_VALUE) maxMore = 0;
+
+        double strandCores  = c.layerCoresMin  > 0
+                ? (remCores  - maxMore * c.layerCoresMin)  / CORE_POINTS_PER_CORE : 0;
+        double strandMem    = c.layerMemMin    > 0
+                ? (remMem    - maxMore * c.layerMemMin)    / KB_PER_GB           : 0;
+        double strandGpus   = c.layerGpusMin   > 0
+                ?  remGpus   - maxMore * c.layerGpusMin                           : 0;
+        double strandGpuMem = c.layerGpuMemMin > 0
+                ? (remGpuMem - maxMore * c.layerGpuMemMin) / KB_PER_GB           : 0;
+
+        return W_CORES   * strandCores
+             + W_MEM     * strandMem
+             + W_GPUS    * strandGpus
+             + W_GPU_MEM * strandGpuMem;
     }
 
     static boolean fitsOnHost(LayerCandidate c, BookableHost h) {
