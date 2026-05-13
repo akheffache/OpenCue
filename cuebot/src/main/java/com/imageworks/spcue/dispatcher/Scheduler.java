@@ -20,10 +20,12 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
@@ -41,18 +43,31 @@ import com.imageworks.spcue.service.HostManager;
 import com.imageworks.spcue.service.JobManager;
 
 /**
- * Scheduler: single-threaded periodic dispatch.
+ * Scheduler: single-threaded periodic dispatch with persistent reservations.
  *
  * Replaces the multi-threaded BookingQueue path. Each tick:
  *
  *   1. Acquire a Postgres advisory lock so only one Cuebot plans at a time.
  *   2. Read bookable hosts.
  *   3. Group them by static spec (alloc, normalized tags, os, has_gpu).
- *   4. For each group, run one candidate-layer query.
- *   5. Walk hosts in the group sequentially; for each host walk the cached
- *      candidates, book what fits, and update in-memory accounting so the
- *      next host sees the depleted job/show counters.
+ *   4. For each group:
+ *        - one candidate-layer query
+ *        - for each candidate in priority order:
+ *            * dispatch loop (respects reservations, overrides lower
+ *              priority on successful dispatch)
+ *            * reconcile: the layer's reservation count should equal its
+ *              remaining pending unfittable frame count
+ *   5. Sweep reservations whose layer no longer appears in any candidate set.
  *   6. Release the lock.
+ *
+ * Reservation invariant: a host's reservation belongs to the highest-priority
+ * layer that has claimed it. A reservation persists across ticks until the
+ * owning layer's pending unfittable frames reach zero, the layer leaves the
+ * dispatchable set, or a higher-priority layer overrides the claim. This
+ * prevents blocked-layer starvation: any layer that doesn't fit anywhere
+ * claims hosts so they aren't re-consumed by lower-priority work between
+ * the moment the layer becomes blocked and the moment hosts free up
+ * enough cores.
  *
  * Gated by scheduler.enabled (default false). When true, HostReportHandler
  * suppresses the legacy BookingQueue enqueue via the existing booking-off
@@ -97,6 +112,20 @@ public class Scheduler extends JdbcDaoSupport {
 
     private final AtomicBoolean tickInFlight = new AtomicBoolean(false);
 
+    /**
+     * Live host reservations, persistent across ticks. Key: host id. Value:
+     * the (layer, priority) pair that has claimed the host. A reservation
+     * is created when a blocked layer's reconcile claims a target host, and
+     * removed when the layer's pending unfittable frame count reaches zero,
+     * the layer leaves the dispatchable set entirely, or a higher-priority
+     * layer overrides the claim.
+     *
+     * Single-writer (the planner thread). Failover via the advisory lock
+     * means a new leader starts with an empty map and rebuilds the same set
+     * within one or two ticks via reconciliation.
+     */
+    private final Map<String, Reservation> reservations = new HashMap<>();
+
     // ---- snapshot queries -------------------------------------------------
 
     /**
@@ -109,10 +138,15 @@ public class Scheduler extends JdbcDaoSupport {
         + "  h.pk_host, "
         + "  h.str_name, "
         + "  h.pk_alloc, "
+        + "  h.int_cores, "
         + "  h.int_cores_idle, "
+        + "  h.int_mem, "
         + "  h.int_mem_idle, "
+        + "  h.int_gpus, "
         + "  h.int_gpus_idle, "
+        + "  h.int_gpu_mem, "
         + "  h.int_gpu_mem_idle, "
+        + "  h.int_procs, "
         + "  h.str_tags, "
         + "  hs.str_os "
         + "FROM host h, host_stat hs "
@@ -129,8 +163,12 @@ public class Scheduler extends JdbcDaoSupport {
      *   - job under int_max_cores
      *   - show under subscription burst on this alloc
      *   - at least one WAITING, depend-resolved frame on the layer
-     *   - layer.int_cores_min fits the group's max idle cores
-     * Ordered by priority + age, capped by LIMIT.
+     *   - layer.int_cores_min fits the group's max host TOTAL cores (not idle
+     *     — a blocked layer waiting on a reserved host stays in the candidate
+     *     set even when no host has it idle right now)
+     * Ordered by priority + age, capped by LIMIT. waiting_frame_count is the
+     * number of dispatchable frames on the layer at query time; reconciliation
+     * uses it to decide how many hosts the layer should reserve.
      */
     private static final String SELECT_CANDIDATES_FOR_GROUP =
         "SELECT "
@@ -145,7 +183,12 @@ public class Scheduler extends JdbcDaoSupport {
         + "  jr.int_cores       AS job_cores_in_use, "
         + "  jr.int_max_cores   AS job_max_cores, "
         + "  sub.int_cores      AS show_cores_in_use, "
-        + "  sub.int_burst      AS show_burst "
+        + "  sub.int_burst      AS show_burst, "
+        + "  ( SELECT COUNT(*) FROM frame f "
+        + "    WHERE  f.pk_layer  = l.pk_layer "
+        + "      AND  f.str_state = 'WAITING' "
+        + "      AND  f.int_depend_count = 0 "
+        + "  ) AS waiting_frame_count "
         + "FROM   layer l "
         + "JOIN   job j           ON j.pk_job  = l.pk_job "
         + "JOIN   job_resource jr ON jr.pk_job = j.pk_job "
@@ -171,15 +214,20 @@ public class Scheduler extends JdbcDaoSupport {
     private static final RowMapper<BookableHost> HOST_MAPPER = new RowMapper<BookableHost>() {
         public BookableHost mapRow(ResultSet rs, int i) throws SQLException {
             BookableHost h = new BookableHost();
-            h.hostId      = rs.getString("pk_host");
-            h.hostName    = rs.getString("str_name");
-            h.pkAlloc     = rs.getString("pk_alloc");
-            h.coresIdle   = rs.getInt("int_cores_idle");
-            h.memIdle     = rs.getLong("int_mem_idle");
-            h.gpusIdle    = rs.getInt("int_gpus_idle");
-            h.gpuMemIdle  = rs.getLong("int_gpu_mem_idle");
-            h.tagsRaw     = rs.getString("str_tags");
-            h.os          = rs.getString("str_os");
+            h.hostId       = rs.getString("pk_host");
+            h.hostName     = rs.getString("str_name");
+            h.pkAlloc      = rs.getString("pk_alloc");
+            h.coresTotal   = rs.getInt("int_cores");
+            h.coresIdle    = rs.getInt("int_cores_idle");
+            h.memTotal     = rs.getLong("int_mem");
+            h.memIdle      = rs.getLong("int_mem_idle");
+            h.gpusTotal    = rs.getInt("int_gpus");
+            h.gpusIdle     = rs.getInt("int_gpus_idle");
+            h.gpuMemTotal  = rs.getLong("int_gpu_mem");
+            h.gpuMemIdle   = rs.getLong("int_gpu_mem_idle");
+            h.runningProcs = rs.getInt("int_procs");
+            h.tagsRaw      = rs.getString("str_tags");
+            h.os           = rs.getString("str_os");
             return h;
         }
     };
@@ -188,18 +236,19 @@ public class Scheduler extends JdbcDaoSupport {
             new RowMapper<LayerCandidate>() {
         public LayerCandidate mapRow(ResultSet rs, int i) throws SQLException {
             LayerCandidate c = new LayerCandidate();
-            c.layerId         = rs.getString("pk_layer");
-            c.jobId           = rs.getString("pk_job");
-            c.showId          = rs.getString("pk_show");
-            c.layerCoresMin   = rs.getInt("int_cores_min");
-            c.layerMemMin     = rs.getLong("int_mem_min");
-            c.layerGpusMin    = rs.getInt("int_gpus_min");
-            c.layerGpuMemMin  = rs.getLong("int_gpu_mem_min");
-            c.priority        = rs.getInt("int_priority");
-            c.jobCoresInUse   = rs.getInt("job_cores_in_use");
-            c.jobMaxCores     = rs.getInt("job_max_cores");
-            c.showCoresInUse  = rs.getInt("show_cores_in_use");
-            c.showBurstCores  = rs.getInt("show_burst");
+            c.layerId            = rs.getString("pk_layer");
+            c.jobId              = rs.getString("pk_job");
+            c.showId             = rs.getString("pk_show");
+            c.layerCoresMin      = rs.getInt("int_cores_min");
+            c.layerMemMin        = rs.getLong("int_mem_min");
+            c.layerGpusMin       = rs.getInt("int_gpus_min");
+            c.layerGpuMemMin     = rs.getLong("int_gpu_mem_min");
+            c.priority           = rs.getInt("int_priority");
+            c.jobCoresInUse      = rs.getInt("job_cores_in_use");
+            c.jobMaxCores        = rs.getInt("job_max_cores");
+            c.showCoresInUse     = rs.getInt("show_cores_in_use");
+            c.showBurstCores     = rs.getInt("show_burst");
+            c.waitingFrameCount  = rs.getInt("waiting_frame_count");
             return c;
         }
     };
@@ -236,26 +285,92 @@ public class Scheduler extends JdbcDaoSupport {
         }
     }
 
+    /**
+     * One scheduling tick. The algorithm in order:
+     *
+     *   1. SNAPSHOT
+     *      Read all bookable hosts (UP, OPEN, with at least the minimum
+     *      bookable cores) in one SQL query. Each row carries the host's
+     *      static spec (alloc, tags, OS), its current idle resources, its
+     *      total capacity, and its running proc count.
+     *
+     *   2. GROUP
+     *      Bucket hosts by their static spec key (alloc, normalized tags,
+     *      os, has-gpu). Hosts in the same group share the same set of
+     *      candidate layers, so one candidate query per group instead of
+     *      per host.
+     *
+     *   3. FOR EACH GROUP:
+     *        a. CANDIDATE QUERY
+     *           One SQL per group, returning up to
+     *           scheduler.layer_candidates_per_group_max layers, ordered
+     *           by priority + age. The filter "int_cores_min <= group's
+     *           MAX TOTAL cores" includes blocked layers whose reserved
+     *           hosts are partially loaded; using max IDLE would let them
+     *           drop out of the candidate set and be swept incorrectly.
+     *
+     *        b. DISPATCH AND RECONCILE (priority order)
+     *           Implemented in dispatchGroupWithScoring. For each candidate:
+     *             - Drain by best-fit onto fitting hosts. Reservation
+     *               rules apply: a host reserved at priority >= c.priority
+     *               for another layer is skipped; a host reserved at lower
+     *               priority is usable, and on dispatch c takes ownership.
+     *             - Reconcile c's reservation count to exactly c's
+     *               remaining pending unfittable frame count.
+     *           Layer ids encountered are added to seenLayerIds for the
+     *           end-of-tick sweep.
+     *
+     *   4. SWEEP
+     *      Any reservation whose layer didn't appear in any candidate set
+     *      this tick is dropped. That layer is no longer dispatchable
+     *      (job paused, completed, deleted, or its int_cores_min exceeds
+     *      every host's total capacity), so its claim is stale.
+     *
+     * The reservation map persists across ticks. The single invariant is
+     * that a host's reservation belongs to the highest-priority layer
+     * that has claimed it; every operation above respects this. A new
+     * leader after failover starts with an empty map and rebuilds the
+     * same set within one or two ticks via the reconcile step.
+     *
+     * @return total number of procs dispatched this tick
+     */
     private int doTick() {
+        // 1. SNAPSHOT
         List<BookableHost> hosts = readBookableHosts();
-        if (hosts.isEmpty()) return 0;
+        if (hosts.isEmpty()) {
+            // No bookable hosts. Leave existing reservations alone; they
+            // belong to layers whose hosts are simply unavailable this tick.
+            return 0;
+        }
 
+        // 2. GROUP
         Map<HostSpecKey, List<BookableHost>> groups = groupByHostSpec(hosts);
+        Set<String> seenLayerIds = new HashSet<>();
 
         int dispatched = 0;
         for (Map.Entry<HostSpecKey, List<BookableHost>> g : groups.entrySet()) {
             HostSpecKey spec = g.getKey();
             List<BookableHost> groupHosts = g.getValue();
 
-            int maxIdleInGroup = groupHosts.stream()
-                    .mapToInt(h -> h.coresIdle).max().orElse(0);
+            // 3a. CANDIDATE QUERY (one per group)
+            // Filter against max host *total* cores in the group, not max
+            // idle. A blocked layer waiting on a partially-loaded reserved
+            // host must remain in the candidate set so its reservation
+            // survives sweep.
+            int maxCoresTotalInGroup = groupHosts.stream()
+                    .mapToInt(h -> h.coresTotal).max().orElse(0);
 
             List<LayerCandidate> candidates =
-                    readLayerCandidatesForGroup(spec, maxIdleInGroup);
+                    readLayerCandidatesForGroup(spec, maxCoresTotalInGroup);
             if (candidates.isEmpty()) continue;
 
-            dispatched += dispatchGroupWithScoring(groupHosts, candidates);
+            // 3b. DISPATCH AND RECONCILE (priority order)
+            dispatched += dispatchGroupWithScoring(groupHosts, candidates, seenLayerIds);
         }
+
+        // 4. SWEEP orphans
+        reservations.entrySet().removeIf(e -> !seenLayerIds.contains(e.getValue().layerId));
+
         return dispatched;
     }
 
@@ -330,25 +445,28 @@ public class Scheduler extends JdbcDaoSupport {
     // ---- placement: layer-driven, best-fit -------------------------------
 
     /**
-     * Layer-driven placement. For each candidate in priority order:
+     * Layer-driven placement with persistent reservations. For each
+     * candidate in priority order:
      *
-     *   1. Score every fitting host with {@link #placementScore} and pick
-     *      the one with the lowest score (best fit).
-     *   2. Dispatch on that host. {@code dispatcher.dispatchHost(host, layer)}
-     *      books up to {@code job_frame_dispatch_max} frames in one call.
-     *   3. Update in-memory accounting and loop. If the layer still has
-     *      waiting frames AND another host can fit it, dispatch again. This
-     *      preserves deep booking: a high-priority layer with many frames
-     *      drains across all fitting hosts (in best-fit order) before the
-     *      next-priority layer starts.
+     *   1. Dispatch loop: score every fitting host (respecting reservations)
+     *      with {@link #placementScore} and pick the one with the lowest
+     *      score. Dispatch via {@code dispatcher.dispatchHost(host, layer)}.
+     *      If the chosen host carried a lower-priority reservation, override
+     *      it to c. Loop until no fitting host, no waiting frames, or the
+     *      job/show cap is reached.
+     *   2. Reconcile: c's reservation count should equal c.waitingFrameCount
+     *      (decremented as we dispatched). Drop excess; claim more if short.
      *
-     * Loop exits when the layer has no fitting host, its waiting frame
-     * queue is empty, or its job/show cap is reached.
+     * Layer ids are recorded in {@code seenLayerIds} so the end-of-tick sweep
+     * can drop reservations for layers that left the dispatchable set.
      */
     private int dispatchGroupWithScoring(List<BookableHost> hosts,
-                                         List<LayerCandidate> candidates) {
+                                         List<LayerCandidate> candidates,
+                                         Set<String> seenLayerIds) {
         int dispatched = 0;
         for (LayerCandidate c : candidates) {
+            seenLayerIds.add(c.layerId);
+
             if (c.jobCoresInUse  + c.layerCoresMin > c.jobMaxCores)    continue;
             if (c.showCoresInUse + c.layerCoresMin > c.showBurstCores) continue;
 
@@ -356,7 +474,8 @@ public class Scheduler extends JdbcDaoSupport {
                 BookableHost best = null;
                 double bestScore = Double.POSITIVE_INFINITY;
                 for (BookableHost h : hosts) {
-                    if (!fitsOnHost(c, h)) continue;
+                    if (!reservationAllows(h, c)) continue;
+                    if (!fitsOnHost(c, h))        continue;
                     double score = placementScore(h, c);
                     if (score < bestScore) {
                         bestScore = score;
@@ -382,12 +501,23 @@ public class Scheduler extends JdbcDaoSupport {
                         bookedGpuMem += p.gpuMemoryReserved;
                     }
 
-                    best.coresIdle   -= bookedCores;
-                    best.memIdle     -= bookedMem;
-                    best.gpusIdle    -= bookedGpus;
-                    best.gpuMemIdle  -= bookedGpuMem;
-                    c.jobCoresInUse  += bookedCores;
-                    c.showCoresInUse += bookedCores;
+                    best.coresIdle      -= bookedCores;
+                    best.memIdle        -= bookedMem;
+                    best.gpusIdle       -= bookedGpus;
+                    best.gpuMemIdle     -= bookedGpuMem;
+                    c.jobCoresInUse     += bookedCores;
+                    c.showCoresInUse    += bookedCores;
+                    c.waitingFrameCount -= procs.size();
+
+                    // If the host carried a lower-priority reservation,
+                    // take ownership. A reservation by c or by anyone equal
+                    // or higher is preserved (the second case can't happen
+                    // here because reservationAllows already excluded it).
+                    Reservation existing = reservations.get(best.hostId);
+                    if (existing != null && existing.priority < c.priority) {
+                        reservations.put(best.hostId,
+                                new Reservation(c.layerId, c.priority));
+                    }
 
                     dispatched += procs.size();
 
@@ -402,8 +532,81 @@ public class Scheduler extends JdbcDaoSupport {
                     break;
                 }
             }
+
+            reconcileReservationsForLayer(c, hosts);
         }
         return dispatched;
+    }
+
+    /**
+     * A host's reservation lets c through if there is no reservation, the
+     * reservation belongs to c, or the existing reservation is strictly
+     * lower priority (in which case c may override on successful dispatch).
+     */
+    private boolean reservationAllows(BookableHost h, LayerCandidate c) {
+        Reservation r = reservations.get(h.hostId);
+        return r == null
+            || r.layerId.equals(c.layerId)
+            || r.priority < c.priority;
+    }
+
+    /**
+     * Ensure c holds exactly c.waitingFrameCount reservations. Drops excess
+     * (e.g., we just dispatched some frames so we need fewer reservations)
+     * or claims more via {@link #pickReservationTarget}.
+     */
+    private void reconcileReservationsForLayer(LayerCandidate c, List<BookableHost> hosts) {
+        List<String> mine = new ArrayList<>();
+        for (Map.Entry<String, Reservation> e : reservations.entrySet()) {
+            if (e.getValue().layerId.equals(c.layerId)) mine.add(e.getKey());
+        }
+
+        int have = mine.size();
+        int need = Math.max(0, c.waitingFrameCount);
+
+        if (have > need) {
+            for (String hostId : mine.subList(need, have)) {
+                reservations.remove(hostId);
+            }
+        } else if (have < need) {
+            int want = need - have;
+            for (int i = 0; i < want; i++) {
+                BookableHost t = pickReservationTarget(c, hosts);
+                if (t == null) break;       // no more eligible host
+                Reservation existing = reservations.get(t.hostId);
+                if (existing != null && existing.priority < c.priority) {
+                    logger.info("Scheduler: override reservation host=" + t.hostName
+                            + " layer=" + existing.layerId + "(p=" + existing.priority
+                            + ") -> " + c.layerId + "(p=" + c.priority + ")");
+                }
+                reservations.put(t.hostId, new Reservation(c.layerId, c.priority));
+            }
+        }
+    }
+
+    /**
+     * Pick the host most likely to become available for c soonest, expressed
+     * as "host with the fewest running procs": fewer running frames means
+     * fewer to wait on before the host frees up enough cores for c. The
+     * host must (a) be tag/OS-compatible (granted by group membership),
+     * (b) have enough TOTAL capacity for c when fully idle, and (c) not be
+     * reserved at equal or higher priority for a different layer.
+     */
+    private BookableHost pickReservationTarget(LayerCandidate c, List<BookableHost> hosts) {
+        BookableHost best = null;
+        int bestProcs = Integer.MAX_VALUE;
+        for (BookableHost h : hosts) {
+            if (h.coresTotal  < c.layerCoresMin)   continue;
+            if (h.memTotal    < c.layerMemMin)     continue;
+            if (h.gpusTotal   < c.layerGpusMin)    continue;
+            if (h.gpuMemTotal < c.layerGpuMemMin)  continue;
+            if (!reservationAllows(h, c))          continue;
+            if (h.runningProcs < bestProcs) {
+                bestProcs = h.runningProcs;
+                best = h;
+            }
+        }
+        return best;
     }
 
     /**
@@ -528,10 +731,21 @@ public class Scheduler extends JdbcDaoSupport {
         String hostId;
         String hostName;
         String pkAlloc;
+        // Total capacity. Used by pickReservationTarget to check whether the
+        // host could fit a layer when fully idle, independent of the host's
+        // current load.
+        int    coresTotal;
+        long   memTotal;
+        int    gpusTotal;
+        long   gpuMemTotal;
+        // Current idle resources. Decremented as we dispatch within a tick.
         int    coresIdle;
         long   memIdle;
         int    gpusIdle;
         long   gpuMemIdle;
+        // Current running proc count. Used as the "soonest-to-free" heuristic
+        // for reservation target selection.
+        int    runningProcs;
         String tagsRaw;
         String os;
     }
@@ -550,6 +764,28 @@ public class Scheduler extends JdbcDaoSupport {
         int    jobMaxCores;
         int    showCoresInUse;
         int    showBurstCores;
+        // Number of pending unfittable frames. Initialized from
+        // waiting_frame_count in the candidate query; decremented as the
+        // layer dispatches in this tick. Reconcile keeps the layer's
+        // reservation count equal to this value.
+        int    waitingFrameCount;
+    }
+
+    /**
+     * A claim on a host by a specific layer at a specific priority. Stored
+     * by host id. Persistent across ticks. The priority is what the override
+     * comparison uses; storing it on the reservation (rather than looking it
+     * up from the current candidate set) means an override decision works
+     * even when the owner layer doesn't appear in the current group's
+     * candidates.
+     */
+    static final class Reservation {
+        final String layerId;
+        final int    priority;
+        Reservation(String layerId, int priority) {
+            this.layerId  = layerId;
+            this.priority = priority;
+        }
     }
 
     static final class HostSpecKey {
