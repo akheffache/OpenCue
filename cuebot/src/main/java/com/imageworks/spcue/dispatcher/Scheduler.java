@@ -19,6 +19,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -26,7 +27,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
@@ -38,12 +44,12 @@ import org.springframework.jdbc.core.support.JdbcDaoSupport;
 
 import com.imageworks.spcue.DispatchHost;
 import com.imageworks.spcue.LayerInterface;
-import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.service.HostManager;
 import com.imageworks.spcue.service.JobManager;
 
 /**
- * Scheduler: single-threaded periodic dispatch with persistent reservations.
+ * Scheduler: single-threaded planner with persistent reservations and a
+ * parallel commit pool.
  *
  * Replaces the multi-threaded BookingQueue path. Each tick:
  *
@@ -54,11 +60,23 @@ import com.imageworks.spcue.service.JobManager;
  *        - one candidate-layer query
  *        - for each candidate in priority order:
  *            * dispatch loop (respects reservations, overrides lower
- *              priority on successful dispatch)
+ *              priority on successful dispatch); submits each
+ *              (host, layer) pairing to the commit pool and decrements
+ *              in-memory accounting from an estimate
  *            * reconcile: the layer's reservation count should equal its
  *              remaining pending unfittable frame count
- *   5. Sweep reservations whose layer no longer appears in any candidate set.
- *   6. Release the lock.
+ *   5. Wait for the commit pool to drain.
+ *   6. Sweep reservations whose layer no longer appears in any candidate set.
+ *   7. Release the lock.
+ *
+ * Planning stays single-threaded so decisions never race on shared state.
+ * Commits run on a fixed-size pool consuming a PriorityBlockingQueue ordered
+ * by layer priority: I/O parallelism without re-introducing the decision
+ * races the old BookingQueue suffered from. Within-layer frame collisions
+ * (two workers dispatching different hosts for the same layer can land on
+ * overlapping frame snapshots) are caught by the existing
+ * frame.int_version optimistic lock; the loser rolls back and the worker
+ * iterates to the next frame.
  *
  * Reservation invariant: a host's reservation belongs to the highest-priority
  * layer that has claimed it. A reservation persists across ticks until the
@@ -125,6 +143,41 @@ public class Scheduler extends JdbcDaoSupport {
      * within one or two ticks via reconciliation.
      */
     private final Map<String, Reservation> reservations = new HashMap<>();
+
+    // ---- commit pool ------------------------------------------------------
+    //
+    // Workers consume CommitTasks from a priority queue and call
+    // dispatcher.dispatchHost(host, layer). The planner submits tasks and
+    // continues, decrementing in-memory accounting from an estimate. doTick
+    // drains the queue before returning so the next tick sees a settled DB.
+
+    private volatile ExecutorService commitPool;
+    private final BlockingQueue<CommitTask> commitQueue =
+            new PriorityBlockingQueue<>(64,
+                    Comparator.<CommitTask>comparingInt(t -> -t.priority));
+    private final AtomicInteger inFlightCommits = new AtomicInteger(0);
+    private int jobFrameDispatchMax;
+
+    /**
+     * Lazy commit-pool init on the first runTick. Avoids touching Spring
+     * XML wiring for an init-method, and Cuebot is well past startup by
+     * the time scheduler.enabled is flipped on.
+     */
+    private synchronized void startCommitPoolIfNeeded() {
+        if (commitPool != null) return;
+        int size = env.getProperty("scheduler.commit_pool_size", Integer.class, 8);
+        jobFrameDispatchMax = env.getProperty("dispatcher.job_frame_dispatch_max",
+                Integer.class, 8);
+        final ExecutorService pool = Executors.newFixedThreadPool(size, r -> {
+            Thread t = new Thread(r);
+            t.setName("Scheduler-commit-" + t.getId());
+            t.setDaemon(true);
+            return t;
+        });
+        for (int i = 0; i < size; i++) pool.submit(this::commitWorker);
+        commitPool = pool;
+        logger.info("Scheduler: commit pool started with " + size + " workers");
+    }
 
     // ---- snapshot queries -------------------------------------------------
 
@@ -262,6 +315,7 @@ public class Scheduler extends JdbcDaoSupport {
             logger.debug("Scheduler: previous tick still running, skipping");
             return;
         }
+        startCommitPoolIfNeeded();
         long t0 = System.currentTimeMillis();
         try {
             if (!acquireLeaderLock()) {
@@ -368,7 +422,12 @@ public class Scheduler extends JdbcDaoSupport {
             dispatched += dispatchGroupWithScoring(groupHosts, candidates, seenLayerIds);
         }
 
-        // 4. SWEEP orphans
+        // 4. AWAIT COMMITS: wait for all submitted bookings to finish so the
+        // next tick's snapshot reflects them. The pool ran in parallel during
+        // step 3b; this is just a barrier, not new latency.
+        awaitCommitsDrain();
+
+        // 5. SWEEP orphans
         reservations.entrySet().removeIf(e -> !seenLayerIds.contains(e.getValue().layerId));
 
         return dispatched;
@@ -484,53 +543,41 @@ public class Scheduler extends JdbcDaoSupport {
                 }
                 if (best == null) break;     // no host can fit this layer
 
-                try {
-                    DispatchHost host = hostManager.getDispatchHost(best.hostId);
-                    LayerInterface layer = jobManager.getLayer(c.layerId);
-                    List<VirtualProc> procs = dispatcher.dispatchHost(host, layer);
-                    if (procs.isEmpty()) break;   // no waiting frames remain
+                // Estimate how many frames this commit will book. The
+                // dispatcher books up to job_frame_dispatch_max per call,
+                // bounded by the same fit checks placementScore uses.
+                long maxMore = computeMaxMore(best, c);
+                int  estFrames = (int) Math.min(jobFrameDispatchMax, maxMore + 1);
+                if (estFrames <= 0) break;
 
-                    int  bookedCores  = 0;
-                    long bookedMem    = 0;
-                    int  bookedGpus   = 0;
-                    long bookedGpuMem = 0;
-                    for (VirtualProc p : procs) {
-                        bookedCores  += p.coresReserved;
-                        bookedMem    += p.memoryReserved;
-                        bookedGpus   += p.gpusReserved;
-                        bookedGpuMem += p.gpuMemoryReserved;
-                    }
+                int  estCores  = estFrames * c.layerCoresMin;
+                long estMem    = (long) estFrames * c.layerMemMin;
+                int  estGpus   = estFrames * c.layerGpusMin;
+                long estGpuMem = (long) estFrames * c.layerGpuMemMin;
 
-                    best.coresIdle      -= bookedCores;
-                    best.memIdle        -= bookedMem;
-                    best.gpusIdle       -= bookedGpus;
-                    best.gpuMemIdle     -= bookedGpuMem;
-                    c.jobCoresInUse     += bookedCores;
-                    c.showCoresInUse    += bookedCores;
-                    c.waitingFrameCount -= procs.size();
+                best.coresIdle      -= estCores;
+                best.memIdle        -= estMem;
+                best.gpusIdle       -= estGpus;
+                best.gpuMemIdle     -= estGpuMem;
+                c.jobCoresInUse     += estCores;
+                c.showCoresInUse    += estCores;
+                c.waitingFrameCount -= estFrames;
 
-                    // If the host carried a lower-priority reservation,
-                    // take ownership. A reservation by c or by anyone equal
-                    // or higher is preserved (the second case can't happen
-                    // here because reservationAllows already excluded it).
-                    Reservation existing = reservations.get(best.hostId);
-                    if (existing != null && existing.priority < c.priority) {
-                        reservations.put(best.hostId,
-                                new Reservation(c.layerId, c.priority));
-                    }
-
-                    dispatched += procs.size();
-
-                    if (c.jobCoresInUse  + c.layerCoresMin > c.jobMaxCores)    break;
-                    if (c.showCoresInUse + c.layerCoresMin > c.showBurstCores) break;
-
-                } catch (RuntimeException e) {
-                    // Host vanished, layer completed, frame race lost, etc.
-                    // Stop draining this layer this tick; next tick reconsiders.
-                    logger.debug("Scheduler skipped (host=" + best.hostId
-                            + ", layer=" + c.layerId + "): " + e.getMessage());
-                    break;
+                // If the host carried a lower-priority reservation,
+                // take ownership. A reservation by c or by anyone equal
+                // or higher is preserved (the second case can't happen
+                // here because reservationAllows already excluded it).
+                Reservation existing = reservations.get(best.hostId);
+                if (existing != null && existing.priority < c.priority) {
+                    reservations.put(best.hostId,
+                            new Reservation(c.layerId, c.priority));
                 }
+
+                submitCommit(best.hostId, c.layerId, c.priority);
+                dispatched += estFrames;
+
+                if (c.jobCoresInUse  + c.layerCoresMin > c.jobMaxCores)    break;
+                if (c.showCoresInUse + c.layerCoresMin > c.showBurstCores) break;
             }
 
             reconcileReservationsForLayer(c, hosts);
@@ -663,38 +710,11 @@ public class Scheduler extends JdbcDaoSupport {
      *     host 64 cores 256GB:   maxMore=15    score = 192  (mem stranded)
      */
     static double placementScore(BookableHost h, LayerCandidate c) {
+        long maxMore = computeMaxMore(h, c);
         long remCores  = h.coresIdle  - c.layerCoresMin;
         long remMem    = h.memIdle    - c.layerMemMin;
         long remGpus   = h.gpusIdle   - c.layerGpusMin;
         long remGpuMem = h.gpuMemIdle - c.layerGpuMemMin;
-
-        long maxMore = Long.MAX_VALUE;
-
-        // Physical fit on each dimension.
-        if (c.layerCoresMin  > 0) maxMore = Math.min(maxMore, remCores  / c.layerCoresMin);
-        if (c.layerMemMin    > 0) maxMore = Math.min(maxMore, remMem    / c.layerMemMin);
-        if (c.layerGpusMin   > 0) maxMore = Math.min(maxMore, remGpus   / c.layerGpusMin);
-        if (c.layerGpuMemMin > 0) maxMore = Math.min(maxMore, remGpuMem / c.layerGpuMemMin);
-
-        // Job int_max_cores cap. Mirrors dispatcher.isJobBookable: the job
-        // cannot exceed int_max_cores cumulatively across this tick's
-        // dispatches. c.jobCoresInUse is updated as we dispatch.
-        if (c.layerCoresMin > 0) {
-            long jobRem = (long) c.jobMaxCores - c.jobCoresInUse - c.layerCoresMin;
-            if (jobRem < 0) jobRem = 0;
-            maxMore = Math.min(maxMore, jobRem / c.layerCoresMin);
-        }
-
-        // Show subscription burst. Mirrors dispatcher.isShowAtOrOverBurst:
-        // the show cannot exceed int_burst on this alloc cumulatively
-        // across this tick's dispatches.
-        if (c.layerCoresMin > 0) {
-            long showRem = (long) c.showBurstCores - c.showCoresInUse - c.layerCoresMin;
-            if (showRem < 0) showRem = 0;
-            maxMore = Math.min(maxMore, showRem / c.layerCoresMin);
-        }
-
-        if (maxMore == Long.MAX_VALUE) maxMore = 0;
 
         double strandCores  = c.layerCoresMin  > 0
                 ? (remCores  - maxMore * c.layerCoresMin)  / CORE_POINTS_PER_CORE : 0;
@@ -709,6 +729,100 @@ public class Scheduler extends JdbcDaoSupport {
              + W_MEM     * strandMem
              + W_GPUS    * strandGpus
              + W_GPU_MEM * strandGpuMem;
+    }
+
+    /**
+     * Predict the number of ADDITIONAL frames of c (beyond the first) that
+     * could be dispatched to h within this tick. Shared by placementScore
+     * (which uses it to compute stranding) and the dispatch loop (which
+     * uses it to estimate the frames a single commit will book).
+     *
+     * Caps applied (mirroring the dispatcher's per-frame fit checks):
+     *   - physical fit on each dimension
+     *   - job int_max_cores  (matches isJobBookable)
+     *   - show int_burst     (matches isShowAtOrOverBurst)
+     *
+     * Per-call caps host_frame_dispatch_max and job_frame_dispatch_max
+     * are NOT applied here because they bound a single dispatch CALL, not
+     * the per-tick total. The dispatch loop applies job_frame_dispatch_max
+     * when estimating a single commit's worth of frames.
+     */
+    static long computeMaxMore(BookableHost h, LayerCandidate c) {
+        long remCores  = h.coresIdle  - c.layerCoresMin;
+        long remMem    = h.memIdle    - c.layerMemMin;
+        long remGpus   = h.gpusIdle   - c.layerGpusMin;
+        long remGpuMem = h.gpuMemIdle - c.layerGpuMemMin;
+
+        long maxMore = Long.MAX_VALUE;
+        if (c.layerCoresMin  > 0) maxMore = Math.min(maxMore, remCores  / c.layerCoresMin);
+        if (c.layerMemMin    > 0) maxMore = Math.min(maxMore, remMem    / c.layerMemMin);
+        if (c.layerGpusMin   > 0) maxMore = Math.min(maxMore, remGpus   / c.layerGpusMin);
+        if (c.layerGpuMemMin > 0) maxMore = Math.min(maxMore, remGpuMem / c.layerGpuMemMin);
+
+        if (c.layerCoresMin > 0) {
+            long jobRem = (long) c.jobMaxCores - c.jobCoresInUse - c.layerCoresMin;
+            if (jobRem < 0) jobRem = 0;
+            maxMore = Math.min(maxMore, jobRem / c.layerCoresMin);
+        }
+        if (c.layerCoresMin > 0) {
+            long showRem = (long) c.showBurstCores - c.showCoresInUse - c.layerCoresMin;
+            if (showRem < 0) showRem = 0;
+            maxMore = Math.min(maxMore, showRem / c.layerCoresMin);
+        }
+        if (maxMore == Long.MAX_VALUE) maxMore = 0;
+        return maxMore;
+    }
+
+    // ---- commit pool: submission, worker, drain ---------------------------
+
+    private void submitCommit(String hostId, String layerId, int priority) {
+        inFlightCommits.incrementAndGet();
+        commitQueue.add(new CommitTask(hostId, layerId, priority));
+    }
+
+    /**
+     * Worker loop. Pulls highest-priority CommitTask off the queue and
+     * runs the dispatch call. Errors are logged and ignored; the version
+     * lock on frame.int_version is the safety net for cross-worker
+     * collisions on overlapping frame snapshots.
+     */
+    private void commitWorker() {
+        while (!Thread.currentThread().isInterrupted()) {
+            CommitTask t;
+            try {
+                t = commitQueue.take();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            try {
+                DispatchHost host = hostManager.getDispatchHost(t.hostId);
+                LayerInterface layer = jobManager.getLayer(t.layerId);
+                dispatcher.dispatchHost(host, layer);
+            } catch (RuntimeException e) {
+                logger.debug("Scheduler commit failed (host=" + t.hostId
+                        + ", layer=" + t.layerId + "): " + e.getMessage());
+            } finally {
+                inFlightCommits.decrementAndGet();
+            }
+        }
+    }
+
+    /**
+     * Block until all submitted commits have completed. Called at the end
+     * of each tick so the next tick's snapshot reflects this tick's
+     * bookings. Polls every 2ms; the planner thread has nothing else to
+     * do until commits drain.
+     */
+    private void awaitCommitsDrain() {
+        while (inFlightCommits.get() > 0) {
+            try {
+                Thread.sleep(2);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     static boolean fitsOnHost(LayerCandidate c, BookableHost h) {
@@ -783,6 +897,25 @@ public class Scheduler extends JdbcDaoSupport {
         final String layerId;
         final int    priority;
         Reservation(String layerId, int priority) {
+            this.layerId  = layerId;
+            this.priority = priority;
+        }
+    }
+
+    /**
+     * A pending dispatch. Submitted by the planner, consumed by a commit
+     * pool worker. The PriorityBlockingQueue orders by descending priority
+     * so under load high-priority layers drain first; same priority is
+     * FCFS via insertion order at the queue's internal level (PBQ doesn't
+     * guarantee FIFO across equal-priority items, but render-farm priority
+     * granularity makes this immaterial).
+     */
+    static final class CommitTask {
+        final String hostId;
+        final String layerId;
+        final int    priority;
+        CommitTask(String hostId, String layerId, int priority) {
+            this.hostId   = hostId;
             this.layerId  = layerId;
             this.priority = priority;
         }
