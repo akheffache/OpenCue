@@ -226,7 +226,6 @@ class SmartScheduler {
         current_now_     = now;
         std::vector<Booking> out;
 
-#if 0
         // ---- 0) Build per-tick lookup caches ----------------------------
         // (a) layer_id -> Layer*, so predicted_free_time avoids the
         //     O(jobs * layers) scan in layer_of() for every running proc.
@@ -248,7 +247,6 @@ class SmartScheduler {
             }
             predicted_free_cache_[h.host_id] = t;
         }
-#endif
 
         // ---- 1) dispatchable layer/job pairs --------------------------
         std::vector<std::pair<Layer*, Job*>> all;
@@ -258,7 +256,7 @@ class SmartScheduler {
                 if (l.waiting_frame_count() > 0)
                     all.emplace_back(&l, &j);
         }
-        if (all.empty()) { current_cluster_ = nullptr; return out; }
+        if (all.empty()) { reservations.clear(); current_cluster_ = nullptr; return out; }
 
         // ---- 2) group hosts by spec ----------------------------------
         std::unordered_map<HostSpecKey, std::vector<Host*>, HostSpecKeyHash> groups;
@@ -270,9 +268,7 @@ class SmartScheduler {
             for (auto& h : c.hosts) groups[spec_key_of(h)].push_back(&h);
         }
 
-#if 0
         std::set<std::string> seen_layer_ids;
-#endif
 
         // ---- 3) per-group dispatch + reconcile -----------------------
         for (auto& [spec, hosts] : groups) {
@@ -301,9 +297,7 @@ class SmartScheduler {
                 cands.resize(candidates_per_group_max);
 
             for (auto& [layer, job] : cands) {
-#if 0
                 seen_layer_ids.insert(layer->layer_id);
-#endif
                 Show& show = c.show_of(layer->show_id);
                 if (job->cores_in_use  + layer->cores_min > job->max_cores)   continue;
                 if (show.cores_in_use  + layer->cores_min > show.burst_cores) continue;
@@ -315,9 +309,7 @@ class SmartScheduler {
                     Host* best        = nullptr;
                     double best_score = std::numeric_limits<double>::infinity();
                     for (Host* h : hosts) {
-#if 0
                         if (!reservation_allows(*h, *layer, job->priority)) continue;
-#endif
                         if (!fits_on_host_idle(*layer, *h))                 continue;
                         double s = placement_score(*h, *layer, *job, show);
                         if (s < best_score) { best_score = s; best = h; }
@@ -337,18 +329,15 @@ class SmartScheduler {
                     f->state              = FrameState::RUNNING;
                     ++dispatched_for_layer;
 
-#if 0
                     auto it = reservations.find(best->host_id);
                     if (it != reservations.end() && it->second.priority < job->priority) {
                         it->second = Reservation{layer->layer_id, job->priority};
                     }
-#endif
 
                     if (job->cores_in_use  + layer->cores_min > job->max_cores)   break;
                     if (show.cores_in_use  + layer->cores_min > show.burst_cores) break;
                 }
 
-#if 0
                 // Update "blocked for N consecutive ticks" counter for this
                 // layer. Lazy reservation: dispatching anything resets it;
                 // failing to dispatch increments it. reconcile only claims
@@ -358,12 +347,9 @@ class SmartScheduler {
                 else                          streak += 1;
 
                 reconcile(*layer, hosts, c.hosts, *job, streak);
-#endif
-                (void)dispatched_for_layer;
             }
         }
 
-#if 0
         // ---- 4) orphan sweep -----------------------------------------
         for (auto it = reservations.begin(); it != reservations.end(); ) {
             if (seen_layer_ids.count(it->second.layer_id) == 0)
@@ -377,7 +363,6 @@ class SmartScheduler {
             else
                 ++it;
         }
-#endif
 
         current_cluster_ = nullptr;
         return out;
