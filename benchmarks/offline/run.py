@@ -185,6 +185,9 @@ def main(argv=None):
                    help="RNG seed (default 0).")
     p.add_argument("--tick-seconds", type=float, default=1.0,
                    help="Simulator tick size (default 1).")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="Scale the host counts (1.0 = full 1553-host cluster, "
+                        "0.1 = ~155 hosts for fast iteration).")
     p.add_argument("--legacy-csv", default=None,
                    help="Where to write per-tick metrics for the Legacy run.")
     p.add_argument("--smart-csv", default=None,
@@ -200,8 +203,8 @@ def main(argv=None):
     )
 
     # Build two identical cluster + workload pairs.
-    cluster_legacy = build_production_cluster(seed=args.seed)
-    cluster_smart  = build_production_cluster(seed=args.seed)
+    cluster_legacy = build_production_cluster(seed=args.seed, scale=args.scale)
+    cluster_smart  = build_production_cluster(seed=args.seed, scale=args.scale)
 
     arrivals_legacy = generate_arrivals(cfg, cluster_legacy.total_cores(),
                                         seed=args.seed + 1)

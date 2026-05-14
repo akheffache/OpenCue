@@ -57,13 +57,18 @@ GB_KB = 1024 * 1024
 KB_PER_GB = float(GB_KB)
 
 
-def build_production_cluster(seed: int = 0) -> Cluster:
-    """Build the cluster with the production host distribution."""
+def build_production_cluster(seed: int = 0, scale: float = 1.0) -> Cluster:
+    """Build the cluster with the production host distribution.
+
+    scale: 0.0 < scale <= 1.0. Multiplies each host-type count, rounded.
+    Use scale=0.1 to get a 1/10th cluster for fast iteration.
+    """
     rng = random.Random(seed)
     hosts: List[Host] = []
     next_id = 1
     for prefix, count, cores, mem_gb, tags in HOSTS_CONFIG:
-        for i in range(count):
+        scaled_count = max(1, int(round(count * scale)))
+        for i in range(scaled_count):
             hosts.append(Host(
                 host_id=f"host-{next_id:05d}",
                 name=f"{prefix}-{i:04d}",
