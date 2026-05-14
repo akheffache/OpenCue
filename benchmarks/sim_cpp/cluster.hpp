@@ -23,6 +23,17 @@
 
 namespace sim {
 
+// CPU oversubscription: render frames don't actually use their full requested
+// cores wall-clock-averaged, so we treat each requested core as consuming
+// CPU_OVERSUBSCRIPTION real cores. Applied symmetrically: a frame's demand
+// and its consumption from a host's idle pool are both scaled by this factor.
+// Memory and GPU stay as hard constraints (OOM-kills are unforgiving).
+inline constexpr double CPU_OVERSUBSCRIPTION = 0.9;
+
+inline double effective_cores(int cores_min) {
+    return CPU_OVERSUBSCRIPTION * static_cast<double>(cores_min);
+}
+
 enum class FrameState : uint8_t { WAITING = 0, RUNNING = 1, DONE = 2 };
 
 struct Frame {
@@ -102,7 +113,7 @@ struct Host {
     int64_t                    gpu_mem_total_kb = 0;
     std::set<std::string>      tags;
     std::optional<std::string> os;
-    int                        cores_idle       = 0;
+    double                     cores_idle       = 0.0;  // in real cores; oversubscribed
     int64_t                    mem_idle_kb      = 0;
     int                        gpus_idle        = 0;
     int64_t                    gpu_mem_idle_kb  = 0;
@@ -140,9 +151,9 @@ struct Cluster {
         return n;
     }
     int64_t total_idle_cores() const {
-        int64_t n = 0;
+        double n = 0;
         for (const auto& h : hosts) n += h.cores_idle;
-        return n;
+        return static_cast<int64_t>(n);
     }
     int64_t waiting_frame_count() const {
         int64_t n = 0;

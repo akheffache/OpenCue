@@ -88,7 +88,7 @@ class Simulator {
                 if (f->finish_time <= now) {
                     Layer* L = layer_of(cluster, *f);
                     if (L) {
-                        h.cores_idle      += L->cores_min;
+                        h.cores_idle      += effective_cores(L->cores_min);
                         h.mem_idle_kb     += L->mem_min_kb;
                         h.gpus_idle       += L->gpus_min;
                         h.gpu_mem_idle_kb += L->gpu_mem_min_kb;

@@ -35,14 +35,14 @@ struct Booking {
 // ---- common helpers -------------------------------------------------------
 
 inline bool fits_on_host_idle(const Layer& L, const Host& h) {
-    return h.cores_idle      >= L.cores_min
+    return h.cores_idle      >= effective_cores(L.cores_min)
         && h.mem_idle_kb     >= L.mem_min_kb
         && h.gpus_idle       >= L.gpus_min
         && h.gpu_mem_idle_kb >= L.gpu_mem_min_kb;
 }
 
 inline bool fits_on_host_total(const Layer& L, const Host& h) {
-    return h.cores_total      >= L.cores_min
+    return static_cast<double>(h.cores_total) >= effective_cores(L.cores_min)
         && h.mem_total_kb     >= L.mem_min_kb
         && h.gpus_total       >= L.gpus_min
         && h.gpu_mem_total_kb >= L.gpu_mem_min_kb;
@@ -117,7 +117,7 @@ class LegacyScheduler {
                 out.push_back({&h, f});
 
                 // Decrement in-memory so subsequent iterations on this host see it.
-                h.cores_idle      -= layer->cores_min;
+                h.cores_idle      -= effective_cores(layer->cores_min);
                 h.mem_idle_kb     -= layer->mem_min_kb;
                 h.gpus_idle       -= layer->gpus_min;
                 h.gpu_mem_idle_kb -= layer->gpu_mem_min_kb;
@@ -226,6 +226,7 @@ class SmartScheduler {
         current_now_     = now;
         std::vector<Booking> out;
 
+#if 0
         // ---- 0) Build per-tick lookup caches ----------------------------
         // (a) layer_id -> Layer*, so predicted_free_time avoids the
         //     O(jobs * layers) scan in layer_of() for every running proc.
@@ -247,6 +248,7 @@ class SmartScheduler {
             }
             predicted_free_cache_[h.host_id] = t;
         }
+#endif
 
         // ---- 1) dispatchable layer/job pairs --------------------------
         std::vector<std::pair<Layer*, Job*>> all;
@@ -256,7 +258,7 @@ class SmartScheduler {
                 if (l.waiting_frame_count() > 0)
                     all.emplace_back(&l, &j);
         }
-        if (all.empty()) { reservations.clear(); current_cluster_ = nullptr; return out; }
+        if (all.empty()) { current_cluster_ = nullptr; return out; }
 
         // ---- 2) group hosts by spec ----------------------------------
         std::unordered_map<HostSpecKey, std::vector<Host*>, HostSpecKeyHash> groups;
@@ -268,7 +270,9 @@ class SmartScheduler {
             for (auto& h : c.hosts) groups[spec_key_of(h)].push_back(&h);
         }
 
+#if 0
         std::set<std::string> seen_layer_ids;
+#endif
 
         // ---- 3) per-group dispatch + reconcile -----------------------
         for (auto& [spec, hosts] : groups) {
@@ -297,7 +301,9 @@ class SmartScheduler {
                 cands.resize(candidates_per_group_max);
 
             for (auto& [layer, job] : cands) {
+#if 0
                 seen_layer_ids.insert(layer->layer_id);
+#endif
                 Show& show = c.show_of(layer->show_id);
                 if (job->cores_in_use  + layer->cores_min > job->max_cores)   continue;
                 if (show.cores_in_use  + layer->cores_min > show.burst_cores) continue;
@@ -309,7 +315,9 @@ class SmartScheduler {
                     Host* best        = nullptr;
                     double best_score = std::numeric_limits<double>::infinity();
                     for (Host* h : hosts) {
+#if 0
                         if (!reservation_allows(*h, *layer, job->priority)) continue;
+#endif
                         if (!fits_on_host_idle(*layer, *h))                 continue;
                         double s = placement_score(*h, *layer, *job, show);
                         if (s < best_score) { best_score = s; best = h; }
@@ -320,7 +328,7 @@ class SmartScheduler {
                     if (!f) break;
                     out.push_back({best, f});
 
-                    best->cores_idle      -= layer->cores_min;
+                    best->cores_idle      -= effective_cores(layer->cores_min);
                     best->mem_idle_kb     -= layer->mem_min_kb;
                     best->gpus_idle       -= layer->gpus_min;
                     best->gpu_mem_idle_kb -= layer->gpu_mem_min_kb;
@@ -329,15 +337,18 @@ class SmartScheduler {
                     f->state              = FrameState::RUNNING;
                     ++dispatched_for_layer;
 
+#if 0
                     auto it = reservations.find(best->host_id);
                     if (it != reservations.end() && it->second.priority < job->priority) {
                         it->second = Reservation{layer->layer_id, job->priority};
                     }
+#endif
 
                     if (job->cores_in_use  + layer->cores_min > job->max_cores)   break;
                     if (show.cores_in_use  + layer->cores_min > show.burst_cores) break;
                 }
 
+#if 0
                 // Update "blocked for N consecutive ticks" counter for this
                 // layer. Lazy reservation: dispatching anything resets it;
                 // failing to dispatch increments it. reconcile only claims
@@ -347,9 +358,12 @@ class SmartScheduler {
                 else                          streak += 1;
 
                 reconcile(*layer, hosts, c.hosts, *job, streak);
+#endif
+                (void)dispatched_for_layer;
             }
         }
 
+#if 0
         // ---- 4) orphan sweep -----------------------------------------
         for (auto it = reservations.begin(); it != reservations.end(); ) {
             if (seen_layer_ids.count(it->second.layer_id) == 0)
@@ -363,6 +377,7 @@ class SmartScheduler {
             else
                 ++it;
         }
+#endif
 
         current_cluster_ = nullptr;
         return out;
@@ -394,6 +409,9 @@ class SmartScheduler {
     }
 
     int64_t compute_max_more(const Host& h, const Layer& L, const Job& job, const Show& show) {
+        // Stranding score uses NOMINAL cores. Oversubscription belongs in the
+        // fit check; mixing it into the score creates fractional-remainder
+        // bias that pushes small frames toward big hosts.
         int64_t rem_c  = static_cast<int64_t>(h.cores_idle)    - L.cores_min;
         int64_t rem_m  = static_cast<int64_t>(h.mem_idle_kb)   - L.mem_min_kb;
         int64_t rem_g  = static_cast<int64_t>(h.gpus_idle)     - L.gpus_min;
