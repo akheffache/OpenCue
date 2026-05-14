@@ -134,6 +134,94 @@ class LegacyScheduler {
 
 
 // ============================================================================
+// Rust: per-layer first-fit, hosts sorted by idle cores desc (core_saturation)
+// ============================================================================
+//
+// Models the new Rust scheduler in rust/crates/scheduler/ on master:
+//   - per-layer iteration (not per-host like Legacy)
+//   - host selection: B-tree by idle cores; default core_saturation=true
+//     picks the most-idle host first
+//   - score-free first-fit on cores+mem (gpu deferred to dispatch time;
+//     we keep it in the fit check for sim correctness)
+//   - no placement score, no stranding heuristic
+//   - no priority reordering inside cluster
+//   - no persistent reservations, no backfill, no preemption
+// Counts one db_op per (layer, host) compatibility check, same proxy as Legacy.
+
+class RustScheduler {
+ public:
+    int64_t db_ops = 0;
+    bool    core_saturation = true;   // mirrors HostBookingStrategy default
+
+    std::vector<Booking> tick(Cluster& c, double now) {
+        (void)now;
+        std::vector<Booking> out;
+
+        // Build dispatchable (layer, job) list. Master iterates jobs in
+        // cluster-feed order, not sorted by priority — we mirror that:
+        // first job that arrived first dispatches first.
+        std::vector<std::pair<Layer*, Job*>> layer_jobs;
+        for (auto& j : c.jobs) {
+            if (j.paused || j.state != "PENDING") continue;
+            for (auto& l : j.layers) {
+                if (l.waiting_frame_count() > 0)
+                    layer_jobs.emplace_back(&l, &j);
+            }
+        }
+        std::sort(layer_jobs.begin(), layer_jobs.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.second->ts_started < b.second->ts_started;
+                  });
+
+        // For each layer, fill the host with the most idle cores first.
+        // Once a host is consumed, re-sort happens implicitly via reselection
+        // in the next layer iteration (we just re-scan).
+        for (const auto& [layer, job] : layer_jobs) {
+            Show& show = c.show_of(layer->show_id);
+
+            while (layer->waiting_frame_count() > 0) {
+                if (job->cores_in_use + layer->cores_min > job->max_cores)   break;
+                if (show.cores_in_use + layer->cores_min > show.burst_cores) break;
+
+                // Scan all hosts, pick the eligible one with max cores_idle
+                // (core_saturation=true). If false, pick min cores_idle.
+                Host* best         = nullptr;
+                double best_cores  = core_saturation
+                                       ? -std::numeric_limits<double>::infinity()
+                                       :  std::numeric_limits<double>::infinity();
+                for (auto& h : c.hosts) {
+                    ++db_ops;
+                    if (!alloc_compatible(*layer, h)) continue;
+                    if (!tags_compatible(*layer, h))  continue;
+                    if (!os_compatible(*layer, h))    continue;
+                    if (!fits_on_host_idle(*layer, h)) continue;
+                    if (core_saturation) {
+                        if (h.cores_idle > best_cores) { best_cores = h.cores_idle; best = &h; }
+                    } else {
+                        if (h.cores_idle < best_cores) { best_cores = h.cores_idle; best = &h; }
+                    }
+                }
+                if (!best) break;   // no host fits this layer this tick
+
+                Frame* f = layer->next_waiting_frame();
+                if (!f) break;
+                out.push_back({best, f});
+
+                best->cores_idle      -= effective_cores(layer->cores_min);
+                best->mem_idle_kb     -= layer->mem_min_kb;
+                best->gpus_idle       -= layer->gpus_min;
+                best->gpu_mem_idle_kb -= layer->gpu_mem_min_kb;
+                job->cores_in_use     += layer->cores_min;
+                show.cores_in_use     += layer->cores_min;
+                f->state              = FrameState::RUNNING;
+            }
+        }
+        return out;
+    }
+};
+
+
+// ============================================================================
 // Smart: group + stranding score + persistent reservations
 // ============================================================================
 
