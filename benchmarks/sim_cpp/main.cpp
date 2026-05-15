@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// CLI entry point. Runs the Legacy and Smart simulators in parallel threads,
-// prints a side-by-side report, optionally writes per-tick CSVs.
+// CLI entry point. Runs two schedulers side-by-side in parallel threads,
+// prints a comparison report, optionally writes per-tick CSVs. Choose
+// which two via --left and --right (any of legacy, rust, smart).
 
 #include "cluster.hpp"
 #include "workload.hpp"
@@ -31,9 +32,10 @@ struct Args {
     double      scale              = 1.0;
     bool        silos              = false;
     bool        smart_ignore_allocs = false;
-    bool        use_rust           = false;
-    std::string legacy_csv;
-    std::string smart_csv;
+    std::string left               = "legacy";  // legacy | rust | smart
+    std::string right              = "smart";
+    std::string left_csv;
+    std::string right_csv;
 };
 
 static void usage(const char* argv0) {
@@ -47,11 +49,12 @@ static void usage(const char* argv0) {
         "  --seed N                 RNG seed [0]\n"
         "  --tick-seconds F         simulator tick size [1.0]\n"
         "  --scale F                cluster scale (0.1 = 1/10 hosts) [1.0]\n"
-        "  --silos                  3-alloc setup: small/mid/big; Legacy enforces\n"
+        "  --silos                  3-alloc setup: small/mid/big; Legacy/Rust enforce\n"
         "  --smart-no-silos         in silos mode, let Smart ignore alloc routing\n"
-        "  --rust                   compare Smart against Rust scheduler instead of Legacy\n"
-        "  --legacy-csv PATH        write per-tick Legacy metrics to CSV\n"
-        "  --smart-csv PATH         write per-tick Smart metrics to CSV\n"
+        "  --left NAME              left column scheduler (legacy|rust|smart) [legacy]\n"
+        "  --right NAME             right column scheduler (legacy|rust|smart) [smart]\n"
+        "  --left-csv PATH          write per-tick left-scheduler metrics\n"
+        "  --right-csv PATH         write per-tick right-scheduler metrics\n"
         "  --help                   show this help\n",
         argv0);
 }
@@ -84,9 +87,14 @@ static bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--scale")              { if (!next(a.scale)) return false; }
         else if (k == "--silos")              { a.silos = true; }
         else if (k == "--smart-no-silos")     { a.smart_ignore_allocs = true; }
-        else if (k == "--rust")               { a.use_rust = true; }
-        else if (k == "--legacy-csv")         { if (!next_s(a.legacy_csv)) return false; }
-        else if (k == "--smart-csv")          { if (!next_s(a.smart_csv)) return false; }
+        // back-compat: --rust swaps Legacy for Rust as left column
+        else if (k == "--rust")               { a.left = "rust"; }
+        else if (k == "--left")               { if (!next_s(a.left)) return false; }
+        else if (k == "--right")              { if (!next_s(a.right)) return false; }
+        else if (k == "--legacy-csv")         { if (!next_s(a.left_csv)) return false; }
+        else if (k == "--smart-csv")          { if (!next_s(a.right_csv)) return false; }
+        else if (k == "--left-csv")           { if (!next_s(a.left_csv)) return false; }
+        else if (k == "--right-csv")          { if (!next_s(a.right_csv)) return false; }
         else if (k == "--help" || k == "-h")  { usage(argv[0]); std::exit(0); }
         else {
             std::fprintf(stderr, "unknown option: %s\n", k.c_str());
@@ -94,7 +102,50 @@ static bool parse_args(int argc, char** argv, Args& a) {
             return false;
         }
     }
+    auto valid = [](const std::string& s) {
+        return s == "legacy" || s == "rust" || s == "smart";
+    };
+    if (!valid(a.left) || !valid(a.right)) {
+        std::fprintf(stderr, "--left/--right must be one of: legacy, rust, smart\n");
+        return false;
+    }
     return true;
+}
+
+struct RunResult {
+    std::vector<TickMetrics>                    metrics;
+    std::unordered_map<std::string, WaitRecord> waits;
+};
+
+static void run_named(const std::string& name, const Args& a,
+                       Cluster&& cluster, std::vector<Job>&& arrivals,
+                       double sim_seconds, RunResult& out) {
+    if (name == "legacy") {
+        Simulator<LegacyScheduler> sim(std::move(cluster), std::move(arrivals),
+                                        LegacyScheduler{}, a.tick_seconds, a.seed + 7);
+        sim.run(sim_seconds);
+        out.metrics = std::move(sim.metrics);
+        out.waits   = std::move(sim.wait_records);
+    } else if (name == "rust") {
+        Simulator<RustScheduler> sim(std::move(cluster), std::move(arrivals),
+                                      RustScheduler{}, a.tick_seconds, a.seed + 7);
+        sim.run(sim_seconds);
+        out.metrics = std::move(sim.metrics);
+        out.waits   = std::move(sim.wait_records);
+    } else {  // smart
+        Simulator<SmartScheduler> sim(std::move(cluster), std::move(arrivals),
+                                       SmartScheduler{}, a.tick_seconds, a.seed + 7);
+        if (a.silos && a.smart_ignore_allocs) sim.scheduler.ignore_allocs = true;
+        sim.run(sim_seconds);
+        out.metrics = std::move(sim.metrics);
+        out.waits   = std::move(sim.wait_records);
+    }
+}
+
+static const char* display_name(const std::string& n) {
+    if (n == "legacy") return "Legacy";
+    if (n == "rust")   return "Rust";
+    return "Smart";
 }
 
 int main(int argc, char** argv) {
@@ -109,7 +160,7 @@ int main(int argc, char** argv) {
     cfg.runtime_median_s     = a.runtime_median;
 
     Cluster cluster_l = build_production_cluster(a.seed, a.scale, a.silos);
-    Cluster cluster_s = build_production_cluster(a.seed, a.scale, a.silos);
+    Cluster cluster_r = build_production_cluster(a.seed, a.scale, a.silos);
     auto    arrivals = generate_arrivals(cfg, cluster_l.total_cores(),
                                           a.seed + 1, a.silos);
 
@@ -119,73 +170,55 @@ int main(int argc, char** argv) {
                 arrivals.size(),
                 a.hours,
                 a.silos ? "yes" : "no",
-                a.silos && a.smart_ignore_allocs ? " (Smart ignores allocs)" : "");
+                a.silos && a.smart_ignore_allocs && (a.left == "smart" || a.right == "smart")
+                    ? " (Smart ignores allocs)" : "");
+    std::printf("comparing: %s vs %s\n", display_name(a.left), display_name(a.right));
 
     auto t_start = std::chrono::steady_clock::now();
 
-    // Baseline thread runs either Legacy or Rust; Smart runs in parallel.
-    // Each thread owns its own cluster, so no contention.
-    auto arrivals_copy = arrivals;
+    auto arrivals_l = arrivals;
+    auto arrivals_r = std::move(arrivals);
 
-    std::vector<TickMetrics>                    metrics_b;
-    std::unordered_map<std::string, WaitRecord> waits_b;
-    const char* baseline_name = a.use_rust ? "Rust" : "Legacy";
-
-    Simulator<SmartScheduler> sim_s(std::move(cluster_s), std::move(arrivals),
-                                     SmartScheduler{},
-                                     a.tick_seconds, a.seed + 7);
-    if (a.silos && a.smart_ignore_allocs) sim_s.scheduler.ignore_allocs = true;
-
-    auto run_baseline = [&]() {
-        if (a.use_rust) {
-            Simulator<RustScheduler> sim_b(std::move(cluster_l), std::move(arrivals_copy),
-                                            RustScheduler{},
-                                            a.tick_seconds, a.seed + 7);
-            sim_b.run(cfg.simulation_seconds);
-            metrics_b = std::move(sim_b.metrics);
-            waits_b   = std::move(sim_b.wait_records);
-        } else {
-            Simulator<LegacyScheduler> sim_b(std::move(cluster_l), std::move(arrivals_copy),
-                                              LegacyScheduler{},
-                                              a.tick_seconds, a.seed + 7);
-            sim_b.run(cfg.simulation_seconds);
-            metrics_b = std::move(sim_b.metrics);
-            waits_b   = std::move(sim_b.wait_records);
-        }
-    };
-
-    auto fut_b = std::async(std::launch::async, run_baseline);
-    auto fut_s = std::async(std::launch::async, [&] { sim_s.run(cfg.simulation_seconds); });
-    fut_b.get();
-    fut_s.get();
+    RunResult res_l, res_r;
+    auto fut_l = std::async(std::launch::async, [&] {
+        run_named(a.left, a, std::move(cluster_l), std::move(arrivals_l),
+                   cfg.simulation_seconds, res_l);
+    });
+    auto fut_r = std::async(std::launch::async, [&] {
+        run_named(a.right, a, std::move(cluster_r), std::move(arrivals_r),
+                   cfg.simulation_seconds, res_r);
+    });
+    fut_l.get();
+    fut_r.get();
 
     auto t_end = std::chrono::steady_clock::now();
     double wall_s = std::chrono::duration<double>(t_end - t_start).count();
     std::printf("wall time: %.2fs (both schedulers in parallel)\n", wall_s);
 
-    auto agg_l = aggregate(metrics_b);
-    auto agg_s = aggregate(sim_s.metrics);
+    auto agg_l = aggregate(res_l.metrics);
+    auto agg_r = aggregate(res_r.metrics);
 
-    std::vector<WaitRecord> waits_l, waits_s;
-    waits_l.reserve(waits_b.size());
-    waits_s.reserve(sim_s.wait_records.size());
-    for (auto& [k, v] : waits_b)             waits_l.push_back(v);
-    for (auto& [k, v] : sim_s.wait_records)  waits_s.push_back(v);
+    std::vector<WaitRecord> waits_l, waits_r;
+    waits_l.reserve(res_l.waits.size());
+    waits_r.reserve(res_r.waits.size());
+    for (auto& [k, v] : res_l.waits) waits_l.push_back(v);
+    for (auto& [k, v] : res_r.waits) waits_r.push_back(v);
 
     double sim_end = cfg.simulation_seconds;
     auto w_l  = wait_stats(waits_l, sim_end, 0);
-    auto w_s  = wait_stats(waits_s, sim_end, 0);
+    auto w_r  = wait_stats(waits_r, sim_end, 0);
     auto ww_l = wait_stats(waits_l, sim_end, 16);
-    auto ww_s = wait_stats(waits_s, sim_end, 16);
-    print_comparison(baseline_name, agg_l, agg_s, w_l, w_s, ww_l, ww_s);
+    auto ww_r = wait_stats(waits_r, sim_end, 16);
+    print_comparison(display_name(a.left), display_name(a.right),
+                      agg_l, agg_r, w_l, w_r, ww_l, ww_r);
 
-    if (!a.legacy_csv.empty()) {
-        write_csv(a.legacy_csv, metrics_b);
-        std::printf("%s per-tick: %s\n", baseline_name, a.legacy_csv.c_str());
+    if (!a.left_csv.empty()) {
+        write_csv(a.left_csv, res_l.metrics);
+        std::printf("%s per-tick: %s\n", display_name(a.left), a.left_csv.c_str());
     }
-    if (!a.smart_csv.empty()) {
-        write_csv(a.smart_csv, sim_s.metrics);
-        std::printf("Smart  per-tick: %s\n", a.smart_csv.c_str());
+    if (!a.right_csv.empty()) {
+        write_csv(a.right_csv, res_r.metrics);
+        std::printf("%s per-tick: %s\n", display_name(a.right), a.right_csv.c_str());
     }
     return 0;
 }

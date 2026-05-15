@@ -148,12 +148,12 @@ inline void row_i(const char* name, int64_t a, int64_t b) {
     std::printf("\n");
 }
 
-inline void print_comparison(const char* baseline_name,
+inline void print_comparison(const char* left_name, const char* right_name,
                               const AggregateStats& l, const AggregateStats& s,
                               const WaitStats& wl, const WaitStats& ws,
                               const WaitStats& wide_l, const WaitStats& wide_s) {
     std::printf("\n%.*s\n", 80, "================================================================================");
-    std::printf("%-34s%12s%12s\n", "METRIC", baseline_name, "Smart");
+    std::printf("%-34s%12s%12s\n", "METRIC", left_name, right_name);
     std::printf("%.*s\n", 80, "================================================================================");
 
     std::printf("\n--- utilization & fragmentation ---\n");
