@@ -134,19 +134,22 @@ class LegacyScheduler {
 
 
 // ============================================================================
-// Rust: per-layer first-fit, hosts sorted by idle cores desc (core_saturation)
+// Rust: per-layer first-fit, packs onto least-idle host (core_saturation)
 // ============================================================================
 //
-// Models the new Rust scheduler in rust/crates/scheduler/ on master:
+// Models the new Rust scheduler in rust/crates/scheduler/ on master.
+// HostBookingStrategy::core_saturation defaults to true: the B-tree of
+// hosts keyed by idle cores is walked forward (ascending) so we pick the
+// host with the FEWEST idle cores that still fits — i.e., we pack onto
+// already-partially-loaded hosts. core_saturation=false would scan in
+// reverse (most-idle-first, spreading).
+//
 //   - per-layer iteration (not per-host like Legacy)
-//   - host selection: B-tree by idle cores; default core_saturation=true
-//     picks the most-idle host first
-//   - score-free first-fit on cores+mem (gpu deferred to dispatch time;
-//     we keep it in the fit check for sim correctness)
-//   - no placement score, no stranding heuristic
-//   - no priority reordering inside cluster
-//   - no persistent reservations, no backfill, no preemption
-// Counts one db_op per (layer, host) compatibility check, same proxy as Legacy.
+//   - least-idle-fits host selection (packs)
+//   - score-free first-fit on cores+mem+gpu
+//   - no placement score, no reservations, no backfill
+// Counts one db_op per (layer, host) compatibility check; the real Rust
+// scheduler does a B-tree O(log n) lookup so this is unfair to it.
 
 class RustScheduler {
  public:
@@ -157,9 +160,6 @@ class RustScheduler {
         (void)now;
         std::vector<Booking> out;
 
-        // Build dispatchable (layer, job) list. Master iterates jobs in
-        // cluster-feed order, not sorted by priority — we mirror that:
-        // first job that arrived first dispatches first.
         std::vector<std::pair<Layer*, Job*>> layer_jobs;
         for (auto& j : c.jobs) {
             if (j.paused || j.state != "PENDING") continue;
@@ -173,9 +173,6 @@ class RustScheduler {
                       return a.second->ts_started < b.second->ts_started;
                   });
 
-        // For each layer, fill the host with the most idle cores first.
-        // Once a host is consumed, re-sort happens implicitly via reselection
-        // in the next layer iteration (we just re-scan).
         for (const auto& [layer, job] : layer_jobs) {
             Show& show = c.show_of(layer->show_id);
 
@@ -183,12 +180,14 @@ class RustScheduler {
                 if (job->cores_in_use + layer->cores_min > job->max_cores)   break;
                 if (show.cores_in_use + layer->cores_min > show.burst_cores) break;
 
-                // Scan all hosts, pick the eligible one with max cores_idle
-                // (core_saturation=true). If false, pick min cores_idle.
+                // core_saturation=true (default) packs: pick the host with the
+                // FEWEST idle cores that still fits. The first booking on a
+                // fresh cluster ties (all hosts identical); subsequent bookings
+                // prefer the same host until saturated, then spill to the next.
                 Host* best         = nullptr;
                 double best_cores  = core_saturation
-                                       ? -std::numeric_limits<double>::infinity()
-                                       :  std::numeric_limits<double>::infinity();
+                                       ?  std::numeric_limits<double>::infinity()
+                                       : -std::numeric_limits<double>::infinity();
                 for (auto& h : c.hosts) {
                     ++db_ops;
                     if (!alloc_compatible(*layer, h)) continue;
@@ -196,12 +195,12 @@ class RustScheduler {
                     if (!os_compatible(*layer, h))    continue;
                     if (!fits_on_host_idle(*layer, h)) continue;
                     if (core_saturation) {
-                        if (h.cores_idle > best_cores) { best_cores = h.cores_idle; best = &h; }
-                    } else {
                         if (h.cores_idle < best_cores) { best_cores = h.cores_idle; best = &h; }
+                    } else {
+                        if (h.cores_idle > best_cores) { best_cores = h.cores_idle; best = &h; }
                     }
                 }
-                if (!best) break;   // no host fits this layer this tick
+                if (!best) break;
 
                 Frame* f = layer->next_waiting_frame();
                 if (!f) break;
