@@ -30,14 +30,14 @@ import farm_spec as spec
 import sim_model
 
 # cuebot logs "Scheduler resv-grant: newGrantees=N totalHeld=M" once per tick
-# that grants at least one reservation (Scheduler.java logs only on an actual
+# that grants at least one reservation (Maestro.java logs only on an actual
 # grant, to stay off the hot path). Parse those two counters.
 _RESV_RE = re.compile(r"resv-grant: newGrantees=(\d+) totalHeld=(\d+)")
 
-# cuebot's periodic "Scheduler stat:" summary line carries "backfilled=N": frames
+# cuebot's periodic "Maestro stat:" summary line carries "backfilled=N": frames
 # placed onto reserved, draining hosts via EASY backfill during that window (it
 # resets per window, so we sum across windows for the cumulative total). The
-# summary fires every scheduler.stat_interval_seconds; simulate.py lowers that
+# summary fires every maestro.stat_interval_seconds; simulate.py lowers that
 # for sim runs (SIM_STAT_INTERVAL_SECONDS) so backfill updates the live tail.
 _BF_RE = re.compile(r"backfilled=(\d+)")
 

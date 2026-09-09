@@ -2,7 +2,7 @@
 *guaranteed* test of reservations: with reservations OFF these jobs can never
 run; with reservations ON they do.
 
-Why it's guaranteed. A work-conserving planner fills any idle core with ready
+Why it's guaranteed. A work-conserving Maestro fills any idle core with ready
 small work. With a deep 1-2 core backlog, cores free a few at a time and are
 refilled within a tick, so a wide block of idle cores never accumulates on a
 single host. A wide frame needs BIG_CORES idle cores at once on one host -- which

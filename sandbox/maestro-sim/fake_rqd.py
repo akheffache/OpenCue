@@ -100,7 +100,7 @@ _DUMMY_HOST = report_pb2.RenderHost(
 # Completion-reporting concurrency. 1 (default) = serial, which matches the
 # original harness baseline. A larger pool models many independent RQDs acking
 # concurrently (useful for drain-throughput tests) but raises contention between
-# the central planner and the legacy keep-proc rebooking. Set via argv[1] or the
+# the central Maestro and the legacy keep-proc rebooking. Set via argv[1] or the
 # RQD_REPORTER_THREADS env var so a run is explicit and reproducible.
 import os
 _REPORTER_THREADS = int(
@@ -117,7 +117,7 @@ _MEM_FAILURE_RATE = float(
 # put it straight back to WAITING WITHOUT spending a retry, because a busy pool is
 # a queue to wait in, not a broken frame. Rate 0 disables it, so every other
 # scenario is unaffected. The status must match cuebot's
-# scheduler.license.denied_exit_statuses.
+# maestro.license.denied_exit_statuses.
 _LIC_DENY_RATE = float(os.environ.get("SIM_LIC_DENY_RATE", "0"))
 _EXIT_LICENSE_DENIED = int(os.environ.get("SIM_LIC_DENY_STATUS", "203"))
 

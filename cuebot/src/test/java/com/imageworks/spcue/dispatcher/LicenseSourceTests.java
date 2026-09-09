@@ -69,9 +69,9 @@ public class LicenseSourceTests {
     /** A LicenseSource reading the temp JSON file through the script provider. */
     private LicenseSource source(String... extraProps) {
         MockEnvironment env = new MockEnvironment();
-        env.setProperty("scheduler.license.provider", "script:cat " + json);
-        env.setProperty("scheduler.license.timeout_seconds", "5");
-        env.setProperty("scheduler.license.stale_seconds", "300");
+        env.setProperty("maestro.license.provider", "script:cat " + json);
+        env.setProperty("maestro.license.timeout_seconds", "5");
+        env.setProperty("maestro.license.stale_seconds", "300");
         for (int i = 0; i + 1 < extraProps.length; i += 2) {
             env.setProperty(extraProps[i], extraProps[i + 1]);
         }
@@ -169,7 +169,7 @@ public class LicenseSourceTests {
     @Test
     public void headroomSubtracted() throws IOException {
         writeJson(mayaJson(nowSec(), 10, 10));
-        LicenseSource ls = source("scheduler.license.headroom.maya", "4");
+        LicenseSource ls = source("maestro.license.headroom.maya", "4");
         ls.poll();
         assertEquals(6, ls.snapshotBudgets(MAYA).get("maya").usable);
     }
@@ -187,7 +187,7 @@ public class LicenseSourceTests {
     @Test
     public void noProviderHoldsEverything() {
         MockEnvironment env = new MockEnvironment();
-        env.setProperty("scheduler.license.provider", " ");
+        env.setProperty("maestro.license.provider", " ");
         LicenseSource ls = new LicenseSource(env, Mockito.mock(JdbcTemplate.class));
         assertFalse(ls.hasProvider());
         assertTrue(ls.snapshotBudgets(MAYA).get("maya").stale);
@@ -219,8 +219,8 @@ public class LicenseSourceTests {
         Files.write(script, ("#!/bin/sh\n" + "head -c 200000 /dev/zero | tr '\\0' 'e' 1>&2\n"
                 + "cat " + json + "\n").getBytes(StandardCharsets.UTF_8));
         MockEnvironment env = new MockEnvironment();
-        env.setProperty("scheduler.license.provider", "script:sh " + script);
-        env.setProperty("scheduler.license.timeout_seconds", "5");
+        env.setProperty("maestro.license.provider", "script:sh " + script);
+        env.setProperty("maestro.license.timeout_seconds", "5");
         LicenseSource ls = new LicenseSource(env, Mockito.mock(JdbcTemplate.class));
         ls.poll();
         assertFalse("valid stdout must win despite a flooded stderr",
@@ -233,8 +233,8 @@ public class LicenseSourceTests {
         Files.write(script, ("#!/bin/sh\n" + "echo 'vendor said no' 1>&2\n" + "exit 3\n")
                 .getBytes(StandardCharsets.UTF_8));
         MockEnvironment env = new MockEnvironment();
-        env.setProperty("scheduler.license.provider", "script:sh " + script);
-        env.setProperty("scheduler.license.timeout_seconds", "5");
+        env.setProperty("maestro.license.provider", "script:sh " + script);
+        env.setProperty("maestro.license.timeout_seconds", "5");
         LicenseSource ls = new LicenseSource(env, Mockito.mock(JdbcTemplate.class));
         ls.poll();
         assertTrue(ls.snapshotBudgets(MAYA).get("maya").stale);

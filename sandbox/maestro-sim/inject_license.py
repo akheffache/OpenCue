@@ -1,4 +1,4 @@
-"""LICENSE test: does the planner respect LIVE license availability?
+"""LICENSE test: does Maestro respect LIVE license availability?
 
 Companion to fake_license.py (the license server) and license_watch.py (the
 verdict). Floods the farm with work that needs application licenses, declared

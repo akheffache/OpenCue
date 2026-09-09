@@ -1,4 +1,4 @@
-"""LICENSE verdict: did the planner ever oversubscribe a live license pool?
+"""LICENSE verdict: did Maestro ever oversubscribe a live license pool?
 
 Companion to fake_license.py (the license server) and inject_license.py (the
 load). Every interval it compares, per license, what the FARM is actually
@@ -71,7 +71,7 @@ TOKEN = "simlicense"
 # the seat count, or the per-host gate is being over-strict.
 SHARE_FACTOR = float(os.environ.get("SIM_LIC_SHARE_FACTOR", "4"))
 # Throughput floor: frames this test's jobs must actually COMPLETE. Without it a
-# planner that held every licensed layer would satisfy every invariant here.
+# Maestro that held every licensed layer would satisfy every invariant here.
 MIN_DONE = int(os.environ.get("SIM_LIC_MIN_DONE", "200"))
 # Fraction of frames fake_rqd fails with the license-denied exit status, and the
 # retry budget those denials are allowed to spend: zero, because requeueing a
@@ -110,7 +110,7 @@ def farm_usage():
     """Per license: RUNNING frames, and the distinct hosts running them.
 
     Counted from the frame table (what RQD is really executing), independent of
-    anything the license server or the planner believes.
+    anything the license server or Maestro believes.
     """
     frames, hosts = {}, {}
     for row in _rows(
@@ -293,7 +293,7 @@ def main():
               "so nothing was proven. Check the provider is reachable.", flush=True)
     elif worst > 0:
         bad = [f"{n} by {over[n]}" for n in names if over[n] > 0]
-        print(f"FAIL: pool oversubscribed ({', '.join(bad)}) -- the planner booked "
+        print(f"FAIL: pool oversubscribed ({', '.join(bad)}) -- Maestro booked "
               f"past what the license server had free, which fails frames at "
               f"checkout on a real farm.", flush=True)
     elif dead > 0:

@@ -19,15 +19,15 @@ import com.imageworks.spcue.dao.ShowDao;
 import org.springframework.core.env.Environment;
 
 /**
- * Interprets {@code scheduler.enabled} as a tri-state progressive-rollout switch (rather than a
- * plain boolean), so the in-process Scheduler can be turned on for one show at a time, the same
- * per-show model the standalone Rust scheduler uses via {@code show.b_scheduler_managed}:
+ * Interprets {@code maestro.enabled} as a tri-state progressive-rollout switch (rather than a plain
+ * boolean), so the in-process Maestro can be turned on for one show at a time, the same per-show
+ * model the standalone Rust scheduler uses via {@code show.b_scheduler_managed}:
  *
  * <ul>
- * <li>{@code no}: Scheduler off; the legacy dispatcher owns every show.</li>
- * <li>{@code facility}: Scheduler plans ALL shows; legacy booking globally suppressed (this is the
- * old {@code scheduler.enabled=true} behaviour).</li>
- * <li>{@code managed}: Scheduler plans only shows flagged {@code b_scheduler_managed=true} (set per
+ * <li>{@code no}: Maestro off; the legacy dispatcher owns every show.</li>
+ * <li>{@code facility}: Maestro plans ALL shows; legacy booking globally suppressed (this is the
+ * old {@code maestro.enabled=true} behaviour).</li>
+ * <li>{@code managed}: Maestro plans only shows flagged {@code b_scheduler_managed=true} (set per
  * show via the show API, exactly like Rust); the legacy dispatcher keeps the rest. The legacy
  * dispatch query already excludes managed shows, so the two partition cleanly.</li>
  * </ul>
@@ -36,28 +36,28 @@ import org.springframework.core.env.Environment;
  * selection lives in the per-show flag, NOT in this string, so Cuebot never has to reconcile a
  * config value into the database.
  */
-public final class SchedulerMode {
+public final class MaestroMode {
 
     private static final org.apache.logging.log4j.Logger logger =
-            org.apache.logging.log4j.LogManager.getLogger(SchedulerMode.class);
+            org.apache.logging.log4j.LogManager.getLogger(MaestroMode.class);
 
     /** Warn about an unrecognized mode string once, not on every report. */
     private static volatile String warnedUnknownMode = null;
 
-    private SchedulerMode() {}
+    private MaestroMode() {}
 
     public static String mode(Environment env) {
-        String m = env.getProperty("scheduler.enabled", "no");
+        String m = env.getProperty("maestro.enabled", "no");
         return (m == null || m.trim().isEmpty()) ? "no" : m.trim();
     }
 
-    /** True when only shows flagged {@code b_scheduler_managed} are planned by the Scheduler. */
+    /** True when only shows flagged {@code b_scheduler_managed} are planned by Maestro. */
     public static boolean managed(Environment env) {
         return mode(env).equalsIgnoreCase("managed");
     }
 
     /**
-     * True when the in-process Scheduler runs at all (facility or managed). An unrecognized value
+     * True when the in-process Maestro runs at all (facility or managed). An unrecognized value
      * counts as {@code no} (legacy dispatcher owns everything) so a config typo can never silently
      * flip dispatch ownership; it is logged once.
      */
@@ -72,7 +72,7 @@ public final class SchedulerMode {
         }
         if (!m.equals(warnedUnknownMode)) {
             warnedUnknownMode = m;
-            logger.error("Unrecognized scheduler.enabled value '" + m
+            logger.error("Unrecognized maestro.enabled value '" + m
                     + "' (expected no|managed|facility); treating as 'no', the legacy"
                     + " dispatcher owns every show.");
         }
@@ -80,7 +80,7 @@ public final class SchedulerMode {
     }
 
     /**
-     * True when the Scheduler owns EVERY show and the legacy BookingQueue is globally suppressed
+     * True when Maestro owns EVERY show and the legacy BookingQueue is globally suppressed
      * (facility-wide rollout / the old boolean {@code true}).
      */
     public static boolean facility(Environment env) {
@@ -89,8 +89,8 @@ public final class SchedulerMode {
     }
 
     /**
-     * Whether the in-process Scheduler, not the legacy dispatcher, owns this show. In
-     * {@code managed} mode this defers to the per-show {@code b_scheduler_managed} flag.
+     * Whether the in-process Maestro, not the legacy dispatcher, owns this show. In {@code managed}
+     * mode this defers to the per-show {@code b_scheduler_managed} flag.
      */
     public static boolean schedules(Environment env, ShowDao showDao, String showId) {
         if (!enabled(env)) {

@@ -1,6 +1,6 @@
 """LOCALITY (same-layer packing) verdict: does the locality bonus actually work?
 
-The scheduler's locality bonus (scheduler.locality_bonus, Scheduler.java) makes
+The scheduler's locality bonus (maestro.locality_bonus, Maestro.java) makes
 placement prefer a host that ALREADY runs the candidate's layer, so a freed core
 is refilled by the same layer (cache/asset warmth). This watcher measures that
 behaviour directly with REFILL AFFINITY: of the procs newly booked between two
@@ -40,7 +40,7 @@ MIN_HIT = float(os.environ.get("SIM_LOCALITY_MIN_HIT", "0.15"))
 MIN_SAMPLES = int(os.environ.get("SIM_LOCALITY_MIN_SAMPLES", "300"))
 CSV = os.environ.get("SIM_LOCALITY_CSV", "")
 # SIM_LOCALITY_MODE=frames counts FRAME STARTS instead of new proc rows. The
-# proc view is right for verifying the planner's bonus (every planner booking is
+# proc view is right for verifying Maestro's bonus (every Maestro booking is
 # a new proc), but it is blind to the legacy dispatcher's same-proc rebooking,
 # which UPDATES the proc it keeps. A frame start is the one event both
 # schedulers produce identically, so it is the fair A/B view. This mode also
@@ -95,7 +95,7 @@ def main_frames():
     # Cache-warmth (TIME locality). The affinity above is binary and
     # instantaneous: a hit needs the layer running on the host at the previous
     # sample. But a host whose last frame of the layer finished seconds ago is
-    # just as warm, and the planner's bonus (fed from live procs only) cannot
+    # just as warm, and Maestro's bonus (fed from live procs only) cannot
     # see it. last_seen remembers, per (layer, host), when the pair last had a
     # running frame; every start that is NOT a live hit is classified by that
     # age. The histogram tells us how much warmth exists just past the

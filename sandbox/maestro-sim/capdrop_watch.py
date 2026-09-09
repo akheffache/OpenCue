@@ -7,7 +7,7 @@ Corner 1, job max cores. Waits until one capdrop job runs wide, then lowers that
 job's job_resource.int_max_cores to ~30% of its live usage (what a user does in
 production with "set max cores" on a running job; the verify trigger's WHEN
 clause exempts cap changes, so the lowering itself always lands). From then on
-the planner's plus-flush for that job arrives over the new cap.
+Maestro's plus-flush for that job arrives over the new cap.
   mirror = job_resource.int_cores
   truth  = COALESCE(SUM(proc.int_cores_reserved), 0) for the job
 

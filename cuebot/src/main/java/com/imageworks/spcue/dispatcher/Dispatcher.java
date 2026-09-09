@@ -32,11 +32,11 @@ public interface Dispatcher {
     // Maximum number of core points that can be assigned to a frame
     public static final int CORE_POINTS_RESERVED_MAX = 2400;
 
-    // Maximum core points per frame when the in-process Scheduler is enabled.
-    // The Scheduler places whole-host-sized layers (it tracks contiguous idle
+    // Maximum core points per frame when the in-process Maestro is enabled.
+    // Maestro places whole-host-sized layers (it tracks contiguous idle
     // cores per host and reserves/drains hosts for wide jobs), so it can honor
     // much wider per-frame reservations than the legacy dispatcher.
-    public static final int CORE_POINTS_RESERVED_MAX_PLANNER = 6400;
+    public static final int CORE_POINTS_RESERVED_MAX_MAESTRO = 6400;
 
     // The default number of core points assigned to a frame, if no core
     // point value is specified
@@ -170,8 +170,8 @@ public interface Dispatcher {
      * Plan (but do not commit) the frames that would be booked for a layer on a host. Runs the same
      * placement logic as {@link #dispatchHost(DispatchHost, LayerInterface)}, candidate query, fit
      * checks, in-memory host resource decrement, but instead of writing each booking, collects the
-     * planned (frame, proc) pairs for the Scheduler to commit in bulk. No DB writes and no RQD
-     * launch happen here.
+     * planned (frame, proc) pairs for Maestro to commit in bulk. No DB writes and no RQD launch
+     * happen here.
      *
      * @param host
      * @param layer

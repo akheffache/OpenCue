@@ -1,4 +1,4 @@
-# scheduler-sim analysis tooling
+# maestro-sim analysis tooling
 
 Ad-hoc benchmarking helpers for comparing scheduler modes (`--mode new|old|rust`)
 under `simulate.py`. **Samplers** record DB/CPU load *during* a run; **plotters**

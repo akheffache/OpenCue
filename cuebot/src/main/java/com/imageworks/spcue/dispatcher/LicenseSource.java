@@ -40,19 +40,19 @@ import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
- * Live view of floating application licenses (Houdini Engine, Katana, Maya, ...) for the planner.
+ * Live view of floating application licenses (Houdini Engine, Katana, Maya, ...) for Maestro.
  *
  * <h2>Why this exists</h2> A {@code limit_record} holds a static number an admin typed. That works
  * for an internal throttle but not for a real license pool, because the pool is also drawn on from
  * outside the cue: artist workstations, CI, other farms. A fixed cap of 100 means nothing when 60
  * seats are already out to people. The only authority on how many seats are free is the license
- * server, so this class polls it and the planner gates against the live number.
+ * server, so this class polls it and Maestro gates against the live number.
  *
  * <h2>Shape</h2> A background daemon thread asks a site-provided endpoint for every license we care
- * about and keeps the answer in memory. The planner never touches the endpoint on the hot path:
- * once per tick it asks for {@link #snapshotBudgets} and gets plain numbers. The provider is either
- * an {@code http://} endpoint or {@code script:<cmd>} wrapping a vendor CLI such as
- * {@code sesictrl}; either way it returns the same JSON:
+ * about and keeps the answer in memory. Maestro never touches the endpoint on the hot path: once
+ * per tick it asks for {@link #snapshotBudgets} and gets plain numbers. The provider is either an
+ * {@code http://} endpoint or {@code script:<cmd>} wrapping a vendor CLI such as {@code sesictrl};
+ * either way it returns the same JSON:
  *
  * <pre>
  * {"queried_at": 1690000000,
@@ -68,8 +68,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * is optional; when present it enables seat counting for host-based licenses and shows which render
  * nodes are dual-used as workstations.
  *
- * <h2>Staleness is the whole difficulty</h2> The planner always acts on a sample that is already
- * old, and between the sample and a real checkout seats move. Two terms correct for that:
+ * <h2>Staleness is the whole difficulty</h2> Maestro always acts on a sample that is already old,
+ * and between the sample and a real checkout seats move. Two terms correct for that:
  *
  * <ul>
  * <li><b>in-flight</b>: frames WE booked since the sample was taken. The server has not seen them
@@ -126,16 +126,15 @@ public class LicenseSource {
         // Trimmed: a properties file with a trailing space would otherwise count as
         // "configured" and start a poller that fails forever, reporting a parse
         // error instead of the truth, which is that nobody set a provider.
-        this.provider = env.getProperty("scheduler.license.provider", "").trim();
-        this.envKey = env.getProperty("scheduler.license.env_key", "CUE_LICENSES");
-        this.pollSeconds = env.getProperty("scheduler.license.poll_seconds", Integer.class, 20);
-        this.timeoutSeconds =
-                env.getProperty("scheduler.license.timeout_seconds", Integer.class, 10);
-        this.staleSeconds = env.getProperty("scheduler.license.stale_seconds", Integer.class, 300);
+        this.provider = env.getProperty("maestro.license.provider", "").trim();
+        this.envKey = env.getProperty("maestro.license.env_key", "CUE_LICENSES");
+        this.pollSeconds = env.getProperty("maestro.license.poll_seconds", Integer.class, 20);
+        this.timeoutSeconds = env.getProperty("maestro.license.timeout_seconds", Integer.class, 10);
+        this.staleSeconds = env.getProperty("maestro.license.stale_seconds", Integer.class, 300);
         this.defaultHeadroom =
-                env.getProperty("scheduler.license.headroom.default", Integer.class, 0);
+                env.getProperty("maestro.license.headroom.default", Integer.class, 0);
         this.inflightPadSeconds =
-                env.getProperty("scheduler.license.inflight_pad_seconds", Integer.class, 5);
+                env.getProperty("maestro.license.inflight_pad_seconds", Integer.class, 5);
     }
 
     /**
@@ -182,7 +181,7 @@ public class LicenseSource {
                 }
             }
         });
-        t.setName("Scheduler-license-poll");
+        t.setName("Maestro-license-poll");
         t.setDaemon(true);
         poller = t;
         t.start();
@@ -239,10 +238,10 @@ public class LicenseSource {
     }
 
     /**
-     * What the planner may book for one license this tick.
+     * What Maestro may book for one license this tick.
      *
      * For a floating license only {@link #usable} matters: frames still bookable right now. For a
-     * host-based license the cap counts distinct hosts, so the planner needs the seat set
+     * host-based license the cap counts distinct hosts, so Maestro needs the seat set
      * ({@link #seats}, hosts that already hold one, including workstations outside the cue) and
      * {@link #seatCap}, the most seats it may let exist.
      */
@@ -274,7 +273,7 @@ public class LicenseSource {
      * licenses, and the seat set plus seat cap for host-based ones.
      *
      * Returns an empty map when licensing is off. When the sample is missing or stale every license
-     * the planner asks about comes back {@code stale}, which holds licensed layers rather than
+     * Maestro asks about comes back {@code stale}, which holds licensed layers rather than
      * guessing.
      *
      * @param wanted license names the current candidate set actually needs; nothing else is
@@ -292,7 +291,7 @@ public class LicenseSource {
             if (nowMs - lastNoProviderWarnMs > STALE_WARN_INTERVAL_MS) {
                 lastNoProviderWarnMs = nowMs;
                 logger.warn("LicenseSource: layers ask for licenses " + wanted
-                        + " but scheduler.license.provider is not configured;"
+                        + " but maestro.license.provider is not configured;"
                         + " holding that work. Configure a provider or remove" + " " + envKey
                         + " from those layers.");
             }
@@ -354,7 +353,7 @@ public class LicenseSource {
                 out.put(name, new LicenseBudget(name, false, 0, 0, Collections.emptySet(), true));
                 continue;
             }
-            int headroom = env.getProperty("scheduler.license.headroom." + name, Integer.class,
+            int headroom = env.getProperty("maestro.license.headroom." + name, Integer.class,
                     defaultHeadroom);
             if (st.hostBased) {
                 // Machines already holding this license: the ones the provider
@@ -583,7 +582,7 @@ public class LicenseSource {
                 readError[0] = e;
             }
         });
-        reader.setName("Scheduler-license-script");
+        reader.setName("Maestro-license-script");
         reader.setDaemon(true);
         reader.start();
         // Drain stderr too, or a chatty script blocks on a full stderr pipe
@@ -596,7 +595,7 @@ public class LicenseSource {
                 // Over the bound or broken pipe: stderr is diagnostics only.
             }
         });
-        errReader.setName("Scheduler-license-script-err");
+        errReader.setName("Maestro-license-script-err");
         errReader.setDaemon(true);
         errReader.start();
         boolean exited = p.waitFor(timeoutSeconds, TimeUnit.SECONDS);

@@ -3,7 +3,7 @@
 The production shape: a layer declares big memory (18G) but asks 1 core. A
 few frames exhaust a host's memory and the rest of its cores sit idle but
 unbookable. With the launch-time core grant on, the scheduler books those
-frames at round(memory / scheduler.expand_threadable_mem_per_core) cores
+frames at round(memory / maestro.expand_threadable_mem_per_core) cores
 (18G / 4G = 5 cores) instead of 1, so the cores work instead of stranding.
 
 Two jobs, one group (same tag):

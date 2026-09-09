@@ -72,7 +72,7 @@ public class ProcDaoJdbc extends JdbcDaoSupport implements ProcDao {
     /**
      * Does an EXTERNAL scheduler (the standalone Rust one) own the five PG accounting tables via
      * its periodic recompute? Only then may a release skip the decrements in favor of a NOTIFY. The
-     * per-show b_scheduler_managed flag alone is NOT enough: the in-process Scheduler's 'managed'
+     * per-show b_scheduler_managed flag alone is NOT enough: the in-process Maestro's 'managed'
      * mode uses the same flag, but ITS bookings increment these tables (the batched resource-delta
      * flush), so its releases must decrement them or the counters ratchet upward until every cap
      * looks full.
@@ -473,7 +473,7 @@ public class ProcDaoJdbc extends JdbcDaoSupport implements ProcDao {
             pointRows.add(new Object[] {e.getValue()[0], e.getValue()[1], e.getKey(), e.getKey()});
         }
 
-        // Same table order as procDestroyed and the Scheduler's booking-side
+        // Same table order as procDestroyed and Maestro's booking-side
         // delta flush (subscription, layer_resource, job_resource,
         // folder_resource, point), keys sorted within each.
         if (!subRows.isEmpty()) {
@@ -1136,7 +1136,7 @@ public class ProcDaoJdbc extends JdbcDaoSupport implements ProcDao {
         // unordered walk interleaves proc and host locks (proc A, host, proc B,
         // ...) and deadlocks against the scheduler's completion flush, which
         // locks all its procs then all its hosts (seen live, reproduced by
-        // scheduler-sim/deadlock_repro.py). With this pre-lock every multi-row
+        // sandbox/maestro-sim/deadlock_repro.py). With this pre-lock every multi-row
         // writer acquires procs first, then hosts, one total order, no cycle.
         java.util.SortedSet<String> lockIds = new java.util.TreeSet<String>(borrowMap.keySet());
         String in = String.join(",", Collections.nCopies(lockIds.size(), "?"));

@@ -20,42 +20,42 @@ import org.springframework.mock.env.MockEnvironment;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-/** Unit tests for the {@link SchedulerMode} tri-state switch. */
-public class SchedulerModeTests {
+/** Unit tests for the {@link MaestroMode} tri-state switch. */
+public class MaestroModeTests {
 
     private static MockEnvironment env(String value) {
-        return new MockEnvironment().withProperty("scheduler.enabled", value);
+        return new MockEnvironment().withProperty("maestro.enabled", value);
     }
 
     @Test
     public void offValues() {
-        assertFalse(SchedulerMode.enabled(env("no")));
-        assertFalse(SchedulerMode.enabled(env("false")));
-        assertFalse(SchedulerMode.enabled(new MockEnvironment())); // unset defaults to no
+        assertFalse(MaestroMode.enabled(env("no")));
+        assertFalse(MaestroMode.enabled(env("false")));
+        assertFalse(MaestroMode.enabled(new MockEnvironment())); // unset defaults to no
     }
 
     @Test
     public void facilityValues() {
         for (String v : new String[] {"facility", "true", "Facility", "TRUE"}) {
-            assertTrue(SchedulerMode.enabled(env(v)));
-            assertTrue(SchedulerMode.facility(env(v)));
-            assertFalse(SchedulerMode.managed(env(v)));
+            assertTrue(MaestroMode.enabled(env(v)));
+            assertTrue(MaestroMode.facility(env(v)));
+            assertFalse(MaestroMode.managed(env(v)));
         }
     }
 
     @Test
     public void managedValue() {
-        assertTrue(SchedulerMode.enabled(env("managed")));
-        assertTrue(SchedulerMode.managed(env("managed")));
-        assertFalse(SchedulerMode.facility(env("managed")));
+        assertTrue(MaestroMode.enabled(env("managed")));
+        assertTrue(MaestroMode.managed(env("managed")));
+        assertFalse(MaestroMode.facility(env("managed")));
     }
 
     @Test
     public void unrecognizedValueFailsSafeToOff() {
         // A typo must never flip dispatch ownership: unknown values count as off.
-        assertFalse(SchedulerMode.enabled(env("mnaged")));
-        assertFalse(SchedulerMode.enabled(env("yes")));
-        assertFalse(SchedulerMode.facility(env("yes")));
-        assertFalse(SchedulerMode.managed(env("yes")));
+        assertFalse(MaestroMode.enabled(env("mnaged")));
+        assertFalse(MaestroMode.enabled(env("yes")));
+        assertFalse(MaestroMode.facility(env("yes")));
+        assertFalse(MaestroMode.managed(env("yes")));
     }
 }

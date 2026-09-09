@@ -58,7 +58,7 @@ torn-down sim that writes its own graphs — then prints a PASS/FAIL summary
 | **DEPENDS** | dependency correctness: no frame ever RUNS with unsatisfied depends, while depends satisfy and previously-gated frames run (coverage floors) |
 | **FAILOVER** | HA / leader election: the leader cuebot is killed mid-run and the standby takes over booking AND keeps accepting submissions (all clients re-dial the survivor like a real farm's multi-cuebot config) |
 | **TAGS_GPU** | one mixed run where capability tags AND a GPU slice fragment the farm at once: zero tag/GPU placement violations, GPUs and GPU memory never oversubscribed, every tag pool still runs work |
-| **TAGMAX** | the planner's cross-group layer dedup under maximal fragmentation: 120 capability tags shatter the full farm into host-spec groups while 30% of layers are run-anywhere (`general`, a candidate in every group at once), and `raceLost` (planned frames that lost the `frame.int_version` race at commit) must stay a small fraction of planned — proof no layer is re-planned across groups only to lose every copy but one |
+| **TAGMAX** | Maestro's cross-group layer dedup under maximal fragmentation: 120 capability tags shatter the full farm into host-spec groups while 30% of layers are run-anywhere (`general`, a candidate in every group at once), and `raceLost` (planned frames that lost the `frame.int_version` race at commit) must stay a small fraction of planned — proof no layer is re-planned across groups only to lose every copy but one |
 
 **Run it exactly as `python simulate.py --verify` — do not add or change flags.**
 Each scenario is tuned (farm size, oversubscription, frame length) so its verdict
@@ -110,7 +110,7 @@ Run `python metrics.py 120` against a live run anytime.
 #### Mode & scale
 | Flag | Default | What it does |
 |---|---|---|
-| `--mode new\|old\|rust` | `new` | `new` = the E-PVM planner (`Scheduler.java`); `old` = the legacy report-driven dispatcher; `rust` = the standalone Rust scheduler (see below). |
+| `--mode new\|old\|rust` | `new` | `new` = OpenCue Maestro, the E-PVM scheduler (`Maestro.java`); `old` = the legacy report-driven dispatcher; `rust` = the standalone Rust scheduler (see below). |
 | `--cuebots N` | `2` | Cuebot instances against one Postgres. All race the advisory lock so one plans per tick, exercising leader election / HA. Use `1` for a single instance. |
 | `--hosts j,r,e` | full farm | Shrink the farm to these large,medium,small counts (e.g. `2,3,5`) for legible, watchable debugging. |
 
@@ -133,7 +133,7 @@ Run `python metrics.py 120` against a live run anytime.
 | `--depend-test SECS` | `0` | DEPENDS test: assert no frame ever RUNS with unsatisfied depends (plus coverage floors `SIM_DEPEND_MIN_SATISFIED`/`SIM_DEPEND_MIN_STARTED`). Pair with `--feed` (dep trees are its default). Normally driven by `--verify`. |
 | `--failover-test SECS` | `0` | FAILOVER test: kill the leader cuebot at SECS/2 and assert the standby books >= `SIM_FAILOVER_MIN_STARTED` (default 100) new frames in the second half. All clients (reporters, fake RQD, feeder) re-dial the survivor via `SIM_CUEBOT_GRPC_FALLBACKS`; PASS also requires >= `SIM_FAILOVER_MIN_JOBS` (default 3) jobs SUBMITTED after the kill. Needs `--cuebots >= 2` and `--feed`. Normally driven by `--verify`. |
 | `--tag-gpu-test SECS` | `0` | TAGS_GPU test: pair with `--tags N`, `--gpu F` and `--feed` for one mixed run where both constraints intersect. Asserts zero tag/GPU placement violations, no GPU/GPU-mem oversubscription, no negative GPU idle counters; floors: peak GPU procs >= `SIM_TAGGPU_MIN_GPU` (default 50), all N tag pools ran work (demand forced uniform: `SIM_TAG_SKEW=1.0`). Normally driven by `--verify`. |
-| `--tagmax-test SECS` | `0` | TAGMAX test: a heavy full-farm run with many capability tags (`SIM_NTAGS`, default 120) that shatter the farm into host-spec groups, plus a run-anywhere slice (`SIM_GENERAL_FRAC`, default 0.3) of untagged `general` layers that are a candidate in every group at once. Asserts the planner's cross-group layer dedup holds: `raceLost` stays within `SIM_TAGMAX_MAX_RACE` (default 0.10) of planned, across at least `SIM_TAGMAX_MIN_GROUPS` (default 80) groups with at least `SIM_TAGMAX_MIN_PLANNED` (default 5000) planned. Pair with `--feed`. Normally driven by `--verify`. |
+| `--tagmax-test SECS` | `0` | TAGMAX test: a heavy full-farm run with many capability tags (`SIM_NTAGS`, default 120) that shatter the farm into host-spec groups, plus a run-anywhere slice (`SIM_GENERAL_FRAC`, default 0.3) of untagged `general` layers that are a candidate in every group at once. Asserts Maestro's cross-group layer dedup holds: `raceLost` stays within `SIM_TAGMAX_MAX_RACE` (default 0.10) of planned, across at least `SIM_TAGMAX_MIN_GROUPS` (default 80) groups with at least `SIM_TAGMAX_MIN_PLANNED` (default 5000) planned. Pair with `--feed`. Normally driven by `--verify`. |
 
 #### Farm realism / placement stress
 | Flag | Default | What it does |
@@ -147,7 +147,7 @@ Run `python metrics.py 120` against a live run anytime.
 #### Reservations & backfill
 | Flag | Default | What it does |
 |---|---|---|
-| `--reservations` | off | Enable the planner's host reservations for blocked layers (EASY/Maui: time gate + per-class cap). |
+| `--reservations` | off | Enable Maestro's host reservations for blocked layers (EASY/Maui: time gate + per-class cap). |
 | `--reservation-block-seconds S` | `60` | How long a layer must stay blocked before it may reserve. |
 | `--reservation-max-fraction F` | `0.5` | Max fraction of a layer's fitting hosts that reservations may hold. |
 | `--reservation-max-grantees K` | `8` | Max new reservation grants per tick. |
@@ -174,9 +174,9 @@ with `SIM_GRAPH_DIR`).
 
 ## Rust scheduler mode (`--mode rust`)
 `--mode rust` drives the **standalone Rust scheduler** (`rust/crates/scheduler`,
-the `cue-scheduler` binary) instead of cuebot's in-process planner. Like
+the `cue-scheduler` binary) instead of cuebot's in-process Maestro. Like
 `--mode new` (and unlike the legacy report-driven booker) it is a **pull/poll
-planner**: a feed loop queries Postgres for pending work, reads host
+scheduler**: a feed loop queries Postgres for pending work, reads host
 availability from its own DB-backed cache, scores with E-PVM, and books — it is
 not triggered by RQD reports.
 
@@ -184,7 +184,7 @@ How the stack is wired in this mode:
 - a throwaway **Redis** is started for the scheduler's accounting;
 - the sim show is flagged `show.b_scheduler_managed=true` (migration V45 makes
   cuebot's own dispatch skip it); non-rust runs force it back to false;
-- **one cuebot** runs with `scheduler.enabled=false` + `dispatcher.turn_off_booking=true`:
+- **one cuebot** runs with `maestro.enabled=false` + `dispatcher.turn_off_booking=true`:
   it never plans or books, it only handles RQD reports/completions and maintains
   frame/layer/job stats;
 - `scheduler_sim.yaml` is generated (Postgres + Redis coords, E-PVM) and
@@ -220,7 +220,7 @@ so the proto step self-heals.)
 
 The manual equivalent, if you'd rather do it by hand:
 1. **Postgres** reachable; apply cuebot Flyway migrations to a `cuebot` DB, then
-   the base seed: dept/services/config from `../src/main/resources/conf/ddl/postgres/seed_data.sql`
+   the base seed: dept/services/config from `../../cuebot/src/main/resources/conf/ddl/postgres/seed_data.sql`
    plus `sim_seed.sql`.
 2. **Python deps**: `python -m venv venv && venv/bin/pip install grpcio grpcio-tools protobuf`.
 3. **Proto stubs**: compile the OpenCue protos into `opencue_proto/` (scripts add
@@ -256,7 +256,7 @@ script's own location:
 | var | default | what it is |
 |-----|---------|------------|
 | `SIM_FARM` | the dir of `simulate.py` | where the helper scripts + `opencue_proto/` live |
-| `SIM_CUEBOT_DIR` | parent of `SIM_FARM` | cuebot project root (has `gradlew`) |
+| `SIM_CUEBOT_DIR` | `<repo>/cuebot` (two levels above `simulate.py`, then `cuebot/`) | cuebot project root (has `gradlew`) |
 | `SIM_VENV_PY` | the interpreter running `simulate.py` | Python used for the helper scripts |
 | `SIM_JDK_HOME` | `/tmp/jdk-17.0.2` | JDK for gradle; if the dir is absent, the ambient `JAVA_HOME` is used |
 | `SIM_GRADLE_HOME` | `/tmp/ghome-<user>` | gradle user home (`-g`) |
@@ -268,7 +268,7 @@ script's own location:
 
 So from a checkout the common case is simply:
 ```
-# scheduler-sim lives in cuebot/, so SIM_CUEBOT_DIR defaults correctly;
+# maestro-sim lives in sandbox/, next to cuebot/, so SIM_CUEBOT_DIR defaults correctly;
 # run with the venv that has the deps and FARM/VENV_PY resolve themselves:
 path/to/venv/bin/python simulate.py --mode new --hosts 1,1,2 --jobs 3 --stats 30
 ```
@@ -277,8 +277,8 @@ If invoked as **root**, `simulate.py` re-execs itself as `SIM_RUN_USER`
 invoked by a normal user it runs as them with no `sudo` anywhere.
 
 ## Run cuebot with the scheduler on
-Set `scheduler.enabled=true` (and optionally `scheduler.interval_ms`,
-`scheduler.reservations_enabled`). Point cuebot at the same Postgres.
+Set `maestro.enabled=true` (and optionally `maestro.interval_ms`,
+`maestro.reservations_enabled`). Point cuebot at the same Postgres.
 
 ## Drive it
 ```

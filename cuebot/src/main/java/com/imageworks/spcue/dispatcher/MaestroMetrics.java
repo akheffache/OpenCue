@@ -31,26 +31,26 @@ import io.prometheus.client.Gauge;
 import io.prometheus.client.Histogram;
 
 /**
- * Central home for the in-process Scheduler's Prometheus metrics, mirroring the Rust scheduler's
- * metrics module. The Scheduler tallies a plain {@link TickStats} during a tick and hands it over
- * once via {@link #recordTick}; all Prometheus wiring lives here and never throws into the tick.
+ * Central home for the in-process Maestro's Prometheus metrics, mirroring the Rust scheduler's
+ * metrics module. Maestro tallies a plain {@link TickStats} during a tick and hands it over once
+ * via {@link #recordTick}; all Prometheus wiring lives here and never throws into the tick.
  * Recording is a no-op unless {@code metrics.prometheus.collector} is enabled.
  */
 @Component
-public class SchedulerMetrics {
+public class MaestroMetrics {
 
-    private static final Logger logger = LogManager.getLogger(SchedulerMetrics.class);
+    private static final Logger logger = LogManager.getLogger(MaestroMetrics.class);
 
     // Per-group tick outcome (Rust pass_terminated_reason_total). "Produced no
     // work" is 'no work' (nothing eligible) + 'no fit' (farm saturated).
-    private static final Counter groupPass = Counter.build().name("cue_scheduler_group_pass_total")
-            .help("Scheduler per-group tick outcomes by reason: booked; "
+    private static final Counter groupPass = Counter.build().name("cue_maestro_group_pass_total")
+            .help("Maestro per-group tick outcomes by reason: booked; "
                     + "'no fit' (work waiting, farm saturated); 'no work' (nothing eligible); "
                     + "'query error' (candidate query failed, usually a bad tag)")
             .labelNames("env", "cuebot_host", "reason").register();
 
     // Host-spec groups seen this tick (Rust clusters_total).
-    private static final Gauge groups = Gauge.build().name("cue_scheduler_groups_total")
+    private static final Gauge groups = Gauge.build().name("cue_maestro_groups_total")
             .help("Host-spec groups seen in the most recent scheduler tick")
             .labelNames("env", "cuebot_host").register();
 
@@ -58,33 +58,33 @@ public class SchedulerMetrics {
     // 'active' = candidates present (booked or no fit), 'inactive' = none (no work).
     // Makes spec/tag fragmentation legible at a glance -- how many pools are
     // engaged vs sitting idle with no matching work. Sums to groups_total.
-    private static final Gauge groupsByState = Gauge.build().name("cue_scheduler_groups_by_state")
+    private static final Gauge groupsByState = Gauge.build().name("cue_maestro_groups_by_state")
             .help("Host-spec groups by demand this tick: 'active' (has eligible work: "
                     + "booked or no fit) vs 'inactive' (no work)")
             .labelNames("env", "cuebot_host", "state").register();
 
     // Total whole cores in the farm this tick; the denominator that turns
     // fragmented cores into a share of the farm.
-    private static final Gauge farmCores = Gauge.build().name("cue_scheduler_farm_cores_total")
+    private static final Gauge farmCores = Gauge.build().name("cue_maestro_farm_cores_total")
             .help("Total whole cores in the farm in the most recent scheduler tick")
             .labelNames("env", "cuebot_host").register();
 
     // Cores in use per show, SET each tick from a live sum of the procs (never
     // accumulated), so it tracks the farm and cannot drift above it.
-    private static final Gauge showCores = Gauge.build().name("cue_scheduler_show_cores")
+    private static final Gauge showCores = Gauge.build().name("cue_maestro_show_cores")
             .help("Whole cores in use per show, summed live from the procs each tick")
             .labelNames("env", "cuebot_host", "show").register();
 
     // Frames booked per show (Rust frames_dispatched_total); rate() = throughput.
     private static final Counter framesDispatched =
-            Counter.build().name("cue_scheduler_frames_dispatched_total")
+            Counter.build().name("cue_maestro_frames_dispatched_total")
                     .help("Frames booked by the scheduler per show; apply rate() for throughput")
                     .labelNames("env", "cuebot_host", "show").register();
 
     // Tick wall-clock (Rust recompute_cycle_duration_seconds).
     private static final Histogram tickDuration =
-            Histogram.build().name("cue_scheduler_tick_duration_seconds")
-                    .help("Scheduler tick wall-clock duration in seconds")
+            Histogram.build().name("cue_maestro_tick_duration_seconds")
+                    .help("Maestro tick wall-clock duration in seconds")
                     .buckets(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30)
                     .labelNames("env", "cuebot_host").register();
 
@@ -97,7 +97,7 @@ public class SchedulerMetrics {
     // Frames on procs right now, from the live ledger (booked minus drained). The
     // denominator that turns the waitlist's blocked counts into a share of ALL
     // frames the farm handles, so a small blocked slice reads small on the panel.
-    private static final Gauge runningFrames = Gauge.build().name("cue_scheduler_running_frames")
+    private static final Gauge runningFrames = Gauge.build().name("cue_maestro_running_frames")
             .help("Frames on procs right now, from the live booking/drain ledger")
             .labelNames("env", "cuebot_host").register();
 
@@ -129,7 +129,7 @@ public class SchedulerMetrics {
     // (the layer left the host but few foreign frames displaced its caches
     // since), cold is neither. Warm share = warm kinds over the sum.
     private static final Counter bookedLocality =
-            Counter.build().name("cue_scheduler_booked_frames_locality_total")
+            Counter.build().name("cue_maestro_booked_frames_locality_total")
                     .help("Frames booked by cache locality of the chosen host: "
                             + "live_warm (host already runs the layer), "
                             + "cache_warm (layer recently left the host, caches likely intact), "
@@ -148,7 +148,7 @@ public class SchedulerMetrics {
 
     private static final String[] WAIT_REASONS =
             {"flowing", "capacity", "no fit", "limit", "no license", "held"};
-    private static final Gauge waitingFrames = Gauge.build().name("cue_scheduler_waiting_frames")
+    private static final Gauge waitingFrames = Gauge.build().name("cue_maestro_waiting_frames")
             .help("Waiting frames on the last tick's candidate layers, by why they cannot run: "
                     + "flowing (layer booked this tick, backlog is moving); "
                     + "capacity (farm simply full: idle cores cannot cover one frame); "
@@ -169,7 +169,7 @@ public class SchedulerMetrics {
     private final Set<String> lastHealth = new HashSet<>();
 
     @Autowired
-    public SchedulerMetrics(Environment springEnv) {
+    public MaestroMetrics(Environment springEnv) {
         this.enabled = springEnv.getProperty("metrics.prometheus.collector", Boolean.class, false);
         String envKey =
                 springEnv.getProperty("metrics.prometheus.environment_id.environment_variable",
@@ -275,8 +275,8 @@ public class SchedulerMetrics {
     }
 
     /**
-     * Plain per-tick tallies the Scheduler fills during a tick and hands to {@link #recordTick}.
-     * Cores are whole cores. No Prometheus types, so scheduler logic stays decoupled.
+     * Plain per-tick tallies Maestro fills during a tick and hands to {@link #recordTick}. Cores
+     * are whole cores. No Prometheus types, so scheduler logic stays decoupled.
      */
     public static final class TickStats {
         public int groups;

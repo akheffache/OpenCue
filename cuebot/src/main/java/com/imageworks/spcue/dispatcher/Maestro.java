@@ -63,24 +63,24 @@ import com.imageworks.spcue.rqd.RqdClient;
 import com.imageworks.spcue.service.JobManager;
 
 /**
- * Single-threaded planner: one Cuebot holds a Postgres advisory lock and plans each tick while the
+ * Single-threaded Maestro: one Cuebot holds a Postgres advisory lock and plans each tick while the
  * rest idle as warm standbys. Placement is serial so decisions never race; only the per-host plan
  * reads fan out on a pool, and every booking for a tick commits in one batched transaction.
  * Persistent reservations hold hosts for blocked wide layers until enough cores free up.
  *
- * Gated by scheduler.enabled (default false). See docs/_docs/developer-guide/planner.md for the
- * full model.
+ * Gated by maestro.enabled (default false). See docs/_docs/developer-guide/maestro.md for the full
+ * model.
  */
-public class Scheduler extends JdbcDaoSupport {
+public class Maestro extends JdbcDaoSupport {
 
-    private static final Logger logger = LogManager.getLogger(Scheduler.class);
+    private static final Logger logger = LogManager.getLogger(Maestro.class);
 
     // Postgres advisory-lock key, shared by every Cuebot on the database. ASCII "OpenCue".
     private static final long SCHEDULER_LOCK_KEY = 0x4F70656E437565L;
 
     // placementScore (E-PVM) dimension weights: relative importance on the util-fraction scale.
     // GPUs weighted up so a GPU layer prefers the host where it strands the least GPU capacity.
-    // Sourced from scheduler.score_weight_* in startSchedulerPoolsIfNeeded so they can be tuned
+    // Sourced from maestro.score_weight_* in startSchedulerPoolsIfNeeded so they can be tuned
     // per site without a rebuild.
     // Static because placementScore is static (pure helper, also unit-tested directly).
     private static volatile double wCores = 1.0;
@@ -108,7 +108,7 @@ public class Scheduler extends JdbcDaoSupport {
     // frames blanketing one machine, at the price of nibbling more hosts per flood.
     private volatile double layerHostMaxFrac = 0.25;
 
-    // Rss-driven sizing (no configuration, works out of the box; see planner.md 3.9).
+    // Rss-driven sizing (no configuration, works out of the box; see maestro.md 3.9).
     // cores=1 on a threadable layer means "let the system decide": such a layer probes at
     // PROBE_FRAMES running frames while the farm has no rss evidence for it, then every
     // later launch books round(median rss / the group's own memory-per-core) cores with
@@ -116,7 +116,7 @@ public class Scheduler extends JdbcDaoSupport {
     // explicit ask of 2+ cores books at full speed from frame one and is only ever
     // corrected upward. The metric derives from the machines themselves, never a config
     // constant. Probe size is deliberately a constant, not a property. The one exposed
-    // parameter is the memory-per-core ratio (scheduler.mem_per_core, KB): 0 (the
+    // parameter is the memory-per-core ratio (maestro.mem_per_core, KB): 0 (the
     // default, shipped) derives it from each group's own hosts, so sizing follows the
     // hardware out of the box; a studio can pin its core-selling ratio instead.
     static final int PROBE_FRAMES = 8;
@@ -157,7 +157,7 @@ public class Scheduler extends JdbcDaoSupport {
     private FrameCompleteHandler frameCompleteHandler;
 
     // Records each tick's stats to Prometheus via recordTick (runTick).
-    private SchedulerMetrics schedulerMetrics;
+    private MaestroMetrics maestroMetrics;
 
     // Live farm-health ledger (swap, kernel time) fed by host reports; optional so the
     // scheduler runs unchanged where the ledger bean is absent (unit tests).
@@ -169,8 +169,8 @@ public class Scheduler extends JdbcDaoSupport {
     @Autowired(required = false)
     private LayerLiveMem layerLiveMem;
 
-    // The in-progress tick's stats, handed to schedulerMetrics at tick end.
-    private SchedulerMetrics.TickStats lastTickStats;
+    // The in-progress tick's stats, handed to maestroMetrics at tick end.
+    private MaestroMetrics.TickStats lastTickStats;
 
     // Max completions applied per drain transaction (bounds the stop/delete/refund lock footprint).
     private static final int DRAIN_CHUNK = 2000;
@@ -191,25 +191,25 @@ public class Scheduler extends JdbcDaoSupport {
     private final AtomicBoolean tickInFlight = new AtomicBoolean(false);
 
     // This Cuebot's planning-leadership lock connection, or null when standby. Sticky and raw (not
-    // pooled, so Hikari cannot reap it and drop the lock). See planner.md for the failover model.
+    // pooled, so Hikari cannot reap it and drop the lock). See maestro.md for the failover model.
     private volatile Connection leaderConn = null;
 
     // Live host reservations, persistent across ticks: host id -> claiming (layer, priority).
-    // Planner-thread only (single-writer); empty after failover. See planner.md for the model.
+    // Maestro-thread only (single-writer); empty after failover. See maestro.md for the model.
     private final Map<String, Reservation> reservations = new HashMap<>();
 
     // ---- plan / batch-commit / launch -------------------------------------
     // Placement only records (host, layer) pairings; after it, planHost reads each pairing's frames
     // and one batched transaction commits them all, then RQD launches fire on a small pool.
 
-    // Per-tick placements to commit, host id -> layer ids. Planner-thread only; cleared each tick.
+    // Per-tick placements to commit, host id -> layer ids. Maestro-thread only; cleared each tick.
     private final Map<String, List<String>> plannedByHost = new LinkedHashMap<>();
 
     // Layers already placed this tick, across all groups: stops a permissive layer being re-planned
     // per group (the copies would race for the same frames). Keyed on placement, not candidacy.
     private final Set<String> placedLayerIds = new HashSet<>();
 
-    // Tick-scoped planning scratch (planner-thread only, reset each tick by clearTickScratch). Held
+    // Tick-scoped planning scratch (Maestro-thread only, reset each tick by clearTickScratch). Held
     // as fields so the phase methods share them without threading a dozen parameters.
     private final Map<String, Integer> jobCoresUsed = new HashMap<>();
     private final Map<String, Integer> showCoresUsed = new HashMap<>();
@@ -252,18 +252,18 @@ public class Scheduler extends JdbcDaoSupport {
     private final Map<String, int[]> planSliceByHostLayer = new HashMap<>();
     // Layers resized from rss evidence this tick: layerId -> {effective core points,
     // effective memory KB}, read by planBookings so the commit books the same shape the
-    // planner scored.
+    // Maestro scored.
     private final Map<String, long[]> layerResize = new HashMap<>();
 
     // Layer-placements planned this tick, for the tick-breakdown log line.
     private int lastPlacements;
 
     // Consecutive ticks a layer was planned but planHost's commit-time read found zero frames: the
-    // signature of a planner-vs-dispatch eligibility mismatch. Warns at plan_zero_warn_ticks.
+    // signature of a Maestro-vs-dispatch eligibility mismatch. Warns at plan_zero_warn_ticks.
     private final Map<String, Integer> planZeroStreak = new ConcurrentHashMap<>();
 
     // Small bounded pool for post-commit RQD launches (one gRPC per frame); a full queue drops
-    // the launch (launchDropped) rather than blocking the planner.
+    // the launch (launchDropped) rather than blocking Maestro.
     private volatile ExecutorService launchPool;
 
     // Launches dropped because the launch queue was full; the frame is RUNNING in the DB, reconcile
@@ -279,12 +279,12 @@ public class Scheduler extends JdbcDaoSupport {
     // dispatcher.frame_query_max). The legacy job_frame_dispatch_max trickle is not used here:
     // fairness comes from the lottery and the caps, not from tiny commits.
     private volatile int frameQueryMax = 20;
-    // When false, the planner ignores reservations entirely (no claims, none enforced): the bare
+    // When false, Maestro ignores reservations entirely (no claims, none enforced): the bare
     // placement core, for isolating core scheduling from the reservation logic.
     private volatile boolean reservationsEnabled = true;
 
     // Time gate: blocked-time a layer must accrue before it may reserve (wall-clock).
-    // Property scheduler.reservation_block_seconds. See planner.md for the reservation model.
+    // Property maestro.reservation_block_seconds. See maestro.md for the reservation model.
     private volatile long reservationBlockMs = 300_000; // 5 minutes
     // Capacity gate: reservations hold at most this fraction of the hosts that fit a given layer.
     private volatile double reservationMaxFraction = 0.5;
@@ -312,11 +312,11 @@ public class Scheduler extends JdbcDaoSupport {
     // Core points per whole core: OpenCue stores host/proc cores as cores * 100.
     private static final int CORE_POINTS_PER_CORE = 100;
 
-    // Stat-line interval (scheduler.stat_interval_seconds, default 5 min).
+    // Stat-line interval (maestro.stat_interval_seconds, default 5 min).
     private volatile long statIntervalMs = 300_000;
     private long lastSummaryMs = 0;
 
-    // Window accumulators, planner-thread only except summarySkipped (bumped by the CAS-loser
+    // Window accumulators, Maestro-thread only except summarySkipped (bumped by the CAS-loser
     // trigger thread, hence atomic). maybeLogStat emits the consolidated line and resets the
     // window.
     private int summaryTicks = 0; // ticks this Cuebot won and planned
@@ -370,11 +370,11 @@ public class Scheduler extends JdbcDaoSupport {
 
     // ---- batched resource accounting --------------------------------------
     // The legacy per-proc resource UPDATEs serialize on a few hot rows and dominate commit cost at
-    // scale. Instead the planner records per-row deltas and flushes one UPDATE per row after the
+    // scale. Instead Maestro records per-row deltas and flushes one UPDATE per row after the
     // batch commit. Off only when scheduler_manages_resources is true (the Rust scheduler owns the
-    // resource tables then). Set in startSchedulerPoolsIfNeeded. See planner.md section 5.
+    // resource tables then). Set in startSchedulerPoolsIfNeeded. See maestro.md section 5.
     private volatile boolean batchResourceAccounting = true;
-    // Per-row delta buffers: value is {cores, gpus}. Written on the planner
+    // Per-row delta buffers: value is {cores, gpus}. Written on Maestro
     // thread when the batch commit's winners are accounted, then drained in
     // flushResourceDeltas right after the commit.
     // subDeltas key: pkShow + '\t' + pkAlloc
@@ -386,42 +386,40 @@ public class Scheduler extends JdbcDaoSupport {
 
     /**
      * Lazy launch-pool init on the first runTick. Avoids touching Spring XML wiring for an
-     * init-method, and Cuebot is well past startup by the time scheduler.enabled is flipped on.
+     * init-method, and Cuebot is well past startup by the time maestro.enabled is flipped on.
      */
     private synchronized void startSchedulerPoolsIfNeeded() {
         if (launchPool != null)
             return;
-        int launchSize = env.getProperty("scheduler.launch_pool_size", Integer.class, 8);
+        int launchSize = env.getProperty("maestro.launch_pool_size", Integer.class, 8);
         frameQueryMax = env.getProperty("dispatcher.frame_query_max", Integer.class, 20);
-        reservationsEnabled =
-                env.getProperty("scheduler.reservations_enabled", Boolean.class, true);
+        reservationsEnabled = env.getProperty("maestro.reservations_enabled", Boolean.class, true);
         reservationBlockMs =
-                1000L * env.getProperty("scheduler.reservation_block_seconds", Integer.class, 300);
+                1000L * env.getProperty("maestro.reservation_block_seconds", Integer.class, 300);
         reservationMaxFraction =
-                env.getProperty("scheduler.reservation_max_fraction", Double.class, 0.5);
-        backfillEnabled = env.getProperty("scheduler.backfill_enabled", Boolean.class, true);
-        localityEnabled = env.getProperty("scheduler.locality_enabled", Boolean.class, true);
-        localityBonus = env.getProperty("scheduler.locality_bonus", Double.class, 8.0);
-        localityWindowFrames =
-                env.getProperty("scheduler.locality_window_frames", Integer.class, 64);
-        layerHostMaxFrac = env.getProperty("scheduler.layer_host_max_frac", Double.class, 0.25);
-        memPerCoreKb = env.getProperty("scheduler.mem_per_core", Long.class, 0L);
+                env.getProperty("maestro.reservation_max_fraction", Double.class, 0.5);
+        backfillEnabled = env.getProperty("maestro.backfill_enabled", Boolean.class, true);
+        localityEnabled = env.getProperty("maestro.locality_enabled", Boolean.class, true);
+        localityBonus = env.getProperty("maestro.locality_bonus", Double.class, 8.0);
+        localityWindowFrames = env.getProperty("maestro.locality_window_frames", Integer.class, 64);
+        layerHostMaxFrac = env.getProperty("maestro.layer_host_max_frac", Double.class, 0.25);
+        memPerCoreKb = env.getProperty("maestro.mem_per_core", Long.class, 0L);
         // Property name kept from the per-host-limit feature this supersedes, so
         // any site already setting it keeps its value.
-        licenseSeatBonus = env.getProperty("scheduler.host_limit_seat_bonus", Double.class, 16.0);
-        wCores = env.getProperty("scheduler.score_weight_cores", Double.class, 1.0);
-        wMem = env.getProperty("scheduler.score_weight_mem", Double.class, 1.0);
-        wGpus = env.getProperty("scheduler.score_weight_gpus", Double.class, 4.0);
-        wGpuMem = env.getProperty("scheduler.score_weight_gpu_mem", Double.class, 1.0);
+        licenseSeatBonus = env.getProperty("maestro.host_limit_seat_bonus", Double.class, 16.0);
+        wCores = env.getProperty("maestro.score_weight_cores", Double.class, 1.0);
+        wMem = env.getProperty("maestro.score_weight_mem", Double.class, 1.0);
+        wGpus = env.getProperty("maestro.score_weight_gpus", Double.class, 4.0);
+        wGpuMem = env.getProperty("maestro.score_weight_gpu_mem", Double.class, 1.0);
         // Live application licenses. Started here rather than wired as a bean so its poll thread's
-        // life matches the planner's; layers without CUE_LICENSES simply never consult it.
+        // life matches Maestro's; layers without CUE_LICENSES simply never consult it.
         LicenseSource ls = new LicenseSource(env, getJdbcTemplate());
         ls.start();
         licenseSource = ls;
         // Cadence of the consolidated INFO stat line (see maybeLogStat). Default
         // 5 minutes; lower it for a live incident, raise it to quiet the log.
         statIntervalMs =
-                1000L * env.getProperty("scheduler.stat_interval_seconds", Integer.class, 300);
+                1000L * env.getProperty("maestro.stat_interval_seconds", Integer.class, 300);
         // Batch resource accounting unless the Rust scheduler owns those tables
         // via its periodic recompute (scheduler_manages_resources). In that mode
         // procCreated writes nothing and we must not either.
@@ -430,32 +428,32 @@ public class Scheduler extends JdbcDaoSupport {
         // Bounded pool so launches never run on the tick thread (a slow RQD sink would stall the
         // tick). On a full queue we drop the launch and count it: the frame is already running in
         // the DB, so RQD report reconciliation recovers it, and the tick never waits on RQD.
-        int launchQueueSize = env.getProperty("scheduler.launch_queue_size", Integer.class, 16384);
+        int launchQueueSize = env.getProperty("maestro.launch_queue_size", Integer.class, 16384);
         ThreadPoolExecutor pool = new ThreadPoolExecutor(launchSize, launchSize, 0L,
                 TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(launchQueueSize), r -> {
                     Thread t = new Thread(r);
-                    t.setName("Scheduler-launch-" + t.getId());
+                    t.setName("Maestro-launch-" + t.getId());
                     t.setDaemon(true);
                     return t;
                 }, (r, ex) -> {
                     long n = launchDropped.incrementAndGet();
                     if (n % 1000 == 1) {
-                        logger.warn("Scheduler: launch queue full, dropping launch"
+                        logger.warn("Maestro: launch queue full, dropping launch"
                                 + " (total dropped=" + n + "); RQD reconciliation will recover");
                     }
                 });
         launchPool = pool;
         // Read pool for the parallel plan phase. Reads are DB-bound (they block
         // on Postgres, not the CPU), so sizing above the core count is fine.
-        int readSize = env.getProperty("scheduler.read_pool_size", Integer.class, launchSize);
+        int readSize = env.getProperty("maestro.read_pool_size", Integer.class, launchSize);
         readPool = Executors.newFixedThreadPool(readSize, r -> {
             Thread t = new Thread(r);
-            t.setName("Scheduler-read-" + t.getId());
+            t.setName("Maestro-read-" + t.getId());
             t.setDaemon(true);
             return t;
         });
-        logger.info("Scheduler: launch pool started with " + launchSize
-                + " workers, read pool with " + readSize + " workers");
+        logger.info("Maestro: launch pool started with " + launchSize + " workers, read pool with "
+                + readSize + " workers");
     }
 
     // ---- snapshot queries -------------------------------------------------
@@ -579,7 +577,7 @@ public class Scheduler extends JdbcDaoSupport {
             + "    WHERE  j2.str_state = 'PENDING' "
             + "    GROUP BY j2.pk_folder) fu ON fu.pk_folder = j.pk_folder "
             // Live application licenses, carried on the candidate row so the
-            // planner needs no second round trip for them. Joined on pk_layer,
+            // Maestro needs no second round trip for them. Joined on pk_layer,
             // which layer_env is indexed on (i_layer_env_pk_layer); asking the
             // other way round, "which layers declare CUE_LICENSES", has no index
             // to use and would scan every environment variable on the farm once
@@ -598,12 +596,12 @@ public class Scheduler extends JdbcDaoSupport {
             + "        OR j.str_os = ANY(string_to_array(?, ','))) "
             // Jobs run only in their own facility. The legacy dispatcher binds
             // job.pk_facility in every job-finding query; without this the
-            // planner books cross-facility (PARITY's parity_facother archetype)
+            // Maestro books cross-facility (PARITY's parity_facother archetype)
             // because the frame-level plan read never re-checks facility.
             + "  AND  j.pk_facility = ? "
             // ThreadMode.ALL hosts run only threadable layers (bind 1 for ALL
             // groups, 0 otherwise), exactly the legacy dispatcher's clause.
-            // Without it the planner parks non-threadable layers on ALL hosts
+            // Without it Maestro parks non-threadable layers on ALL hosts
             // (idle NIMBY workstations score best), planHost's re-check finds
             // zero frames, and the layer burns its one commit per tick forever.
             + "  AND  (CASE WHEN l.b_threadable = true THEN 1 ELSE 0 END) >= ? "
@@ -644,7 +642,7 @@ public class Scheduler extends JdbcDaoSupport {
             // random()^(1/priority) (Efraimidis-Spirakis) and we take the top LIMIT, so a
             // low-priority layer keeps a share proportional to its priority instead of being
             // starved by a higher-priority stream. GREATEST(...,1) floors the weight for priority
-            // <= 0. Reservation granting uses the same lottery weighting. See planner.md 3.5.
+            // <= 0. Reservation granting uses the same lottery weighting. See maestro.md 3.5.
             + "ORDER BY power(random(), 1.0 / GREATEST(jr.int_priority, 1)) DESC "
             + "LIMIT  ? ";
     // spotless:on
@@ -726,7 +724,7 @@ public class Scheduler extends JdbcDaoSupport {
         if (!isEnabled())
             return;
         if (!tickInFlight.compareAndSet(false, true)) {
-            logger.debug("Scheduler: previous tick still running, skipping");
+            logger.debug("Maestro: previous tick still running, skipping");
             summarySkipped.incrementAndGet();
             return;
         }
@@ -741,7 +739,7 @@ public class Scheduler extends JdbcDaoSupport {
                 long ms = System.currentTimeMillis() - t0;
                 // Per-tick detail at DEBUG; INFO gets one consolidated stat line per
                 // window (maybeLogStat, called in the finally below).
-                logger.debug("Scheduler tick: dispatched " + dispatched + " procs, " + ms
+                logger.debug("Maestro tick: dispatched " + dispatched + " procs, " + ms
                         + " ms, reservations=" + reservations.size());
                 summaryTicks++;
                 summaryDispatched += dispatched;
@@ -755,13 +753,13 @@ public class Scheduler extends JdbcDaoSupport {
                 summaryLicenseBooked += tickLicenseBooked;
                 summaryLicenseHeld += tickLicenseHeld;
                 summaryLicenseTrimmed += tickLicenseTrimmed;
-                if (schedulerMetrics != null && lastTickStats != null) {
+                if (maestroMetrics != null && lastTickStats != null) {
                     lastTickStats.tickDurationMs = ms;
-                    schedulerMetrics.recordTick(lastTickStats);
+                    maestroMetrics.recordTick(lastTickStats);
                 }
             }
         } catch (RuntimeException e) {
-            logger.error("Scheduler tick failed", e);
+            logger.error("Maestro tick failed", e);
         } finally {
             // One consolidated stat line per window, on every tick attempt (leader or
             // standby) so a standby Cuebot still emits a heartbeat. Reached only by the
@@ -783,7 +781,7 @@ public class Scheduler extends JdbcDaoSupport {
     private int drainResolvedCompletions() {
         if (frameCompleteHandler == null)
             return 0;
-        List<QueuedFrameCompletion> resolved = SchedulerCompletionQueue.drain();
+        List<QueuedFrameCompletion> resolved = MaestroCompletionQueue.drain();
         int drained = resolved.size();
         long tDrain0 = System.currentTimeMillis();
         for (int from = 0; from < resolved.size(); from += DRAIN_CHUNK) {
@@ -794,7 +792,7 @@ public class Scheduler extends JdbcDaoSupport {
                 boolean[] won = dispatchSupport.stopFramesBatch(chunk);
                 long tChunk = System.currentTimeMillis() - tChunk0;
                 if (tChunk > 500) {
-                    logger.info("Scheduler drain: stopFramesBatch(" + chunk.size() + ") took "
+                    logger.info("Maestro drain: stopFramesBatch(" + chunk.size() + ") took "
                             + tChunk + "ms");
                 }
                 for (int i = 0; i < won.length; i++) {
@@ -818,13 +816,13 @@ public class Scheduler extends JdbcDaoSupport {
                     }
                 }
             } catch (RuntimeException e) {
-                logger.warn("Scheduler drain: batch of " + chunk.size()
+                logger.warn("Maestro drain: batch of " + chunk.size()
                         + " completions failed, retrying per-report: " + e);
                 for (QueuedFrameCompletion c : chunk) {
                     try {
                         frameCompleteHandler.processReportNow(c.report);
                     } catch (RuntimeException e2) {
-                        logger.warn("Scheduler drain: completion for frame " + c.frame.getName()
+                        logger.warn("Maestro drain: completion for frame " + c.frame.getName()
                                 + " failed: " + e2);
                     }
                 }
@@ -832,7 +830,7 @@ public class Scheduler extends JdbcDaoSupport {
         }
         long tDrain = System.currentTimeMillis() - tDrain0;
         if (tDrain > 1000) {
-            logger.info("Scheduler drain: " + drained + " completions in " + tDrain + "ms");
+            logger.info("Maestro drain: " + drained + " completions in " + tDrain + "ms");
         }
         return drained;
     }
@@ -914,7 +912,7 @@ public class Scheduler extends JdbcDaoSupport {
                 winWaitMax.getOrDefault("held", 0L));
 
         logger.info(String.format(
-                "Scheduler stat: win=%ds ticks=%d skipped=%d lockLost=%d avgTick=%dms maxTick=%dms"
+                "Maestro stat: win=%ds ticks=%d skipped=%d lockLost=%d avgTick=%dms maxTick=%dms"
                         + " | farm hosts=%d idleHosts=%d cores=%d idleCores=%d util=%.1f%% groups=%d"
                         + " | flow committed=%d planned=%d raceLost=%d launchDropped=%d drained=%d postQ=%d"
                         + " | resv held=%d reservedCores=%d granted=%d reqs=%d backfilled=%d backfilledCores=%d%s%s",
@@ -989,7 +987,7 @@ public class Scheduler extends JdbcDaoSupport {
         if (nowMs - lastGroupWarnMs < GROUP_WARN_INTERVAL_MS)
             return;
         lastGroupWarnMs = nowMs;
-        logger.warn("Scheduler: " + groupCount + " host-spec groups for " + hostCount
+        logger.warn("Maestro: " + groupCount + " host-spec groups for " + hostCount
                 + " hosts (a handful is expected). A count near the host count means hosts are"
                 + " fragmenting into near-per-host groups, commonly a host name leaking into the"
                 + " tag set, which collapses planning into one candidate query per host, the very"
@@ -1029,7 +1027,7 @@ public class Scheduler extends JdbcDaoSupport {
         }
         if (folderTrimmed == 0)
             return planned;
-        logger.debug("Scheduler: folder ceiling trimmed " + folderTrimmed
+        logger.debug("Maestro: folder ceiling trimmed " + folderTrimmed
                 + " planned frame(s) over cap this tick");
         return keep;
     }
@@ -1094,7 +1092,7 @@ public class Scheduler extends JdbcDaoSupport {
         if (licTrimmed == 0)
             return planned;
         tickLicenseTrimmed += licTrimmed;
-        logger.debug("Scheduler: license pools trimmed " + licTrimmed
+        logger.debug("Maestro: license pools trimmed " + licTrimmed
                 + " planned frame(s) over live availability this tick");
         return keep;
     }
@@ -1114,12 +1112,12 @@ public class Scheduler extends JdbcDaoSupport {
      * dispatch uses), so the scarce budget is shared roughly in proportion to priority and a
      * low-priority wide job still wins a grant now and then instead of being starved by a
      * higher-priority stream. Existing reservers are always reconciled (refresh or release
-     * promptly); new qualifiers get at most scheduler.reservation_max_grantees grants this tick,
-     * the rest draw again next tick.
+     * promptly); new qualifiers get at most maestro.reservation_max_grantees grants this tick, the
+     * rest draw again next tick.
      */
     private void grantReservations(List<ReservationRequest> reservationReqs) {
         int reservationMaxGrantees =
-                env.getProperty("scheduler.reservation_max_grantees", Integer.class, 8);
+                env.getProperty("maestro.reservation_max_grantees", Integer.class, 8);
         sortByPriorityLottery(reservationReqs);
         logReservationTick(reservationReqs, reservationMaxGrantees);
         int newGrantees = 0;
@@ -1132,7 +1130,7 @@ public class Scheduler extends JdbcDaoSupport {
             }
         }
         if (newGrantees > 0) {
-            logger.info("Scheduler resv-grant: newGrantees=" + newGrantees + " totalHeld="
+            logger.info("Maestro resv-grant: newGrantees=" + newGrantees + " totalHeld="
                     + reservations.size());
         }
         tickGranted = newGrantees;
@@ -1163,7 +1161,7 @@ public class Scheduler extends JdbcDaoSupport {
         if (!logger.isDebugEnabled() || (reservationReqs.isEmpty() && reservations.isEmpty()))
             return;
         StringBuilder sb = new StringBuilder();
-        sb.append("Scheduler resv-tick: requests=").append(reservationReqs.size()).append(" cap=")
+        sb.append("Maestro resv-tick: requests=").append(reservationReqs.size()).append(" cap=")
                 .append(cap).append(" held=").append(reservations.size())
                 .append(" blockThresholdMs=").append(reservationBlockMs);
         if (!reservationReqs.isEmpty()) {
@@ -1221,7 +1219,7 @@ public class Scheduler extends JdbcDaoSupport {
      * the matching stats counter (queryError / noWork / booked / noFit).
      */
     private int planGroup(HostSpecKey spec, List<BookableHost> fullGroup,
-            SchedulerMetrics.TickStats stats) {
+            MaestroMetrics.TickStats stats) {
         List<BookableHost> idleGroup = new ArrayList<>();
         for (BookableHost h : fullGroup) {
             if (h.coresIdle >= Dispatcher.CORE_POINTS_RESERVED_MIN)
@@ -1242,7 +1240,7 @@ public class Scheduler extends JdbcDaoSupport {
             long nowMs = System.currentTimeMillis();
             if (nowMs - lastCandidateErrWarnMs >= GROUP_WARN_INTERVAL_MS) {
                 lastCandidateErrWarnMs = nowMs;
-                logger.warn("Scheduler: candidate query failed for " + spec
+                logger.warn("Maestro: candidate query failed for " + spec
                         + "; skipping the group this tick. A malformed layer tag regex is"
                         + " the usual cause; the database error names the layer's tags: "
                         + e.getMessage());
@@ -1287,7 +1285,7 @@ public class Scheduler extends JdbcDaoSupport {
         for (LayerCandidate lc : candidates)
             if (lc.layerCoresMin > 100)
                 wideCount++;
-        logger.debug("Scheduler group: " + spec + " hosts=" + fullGroup.size() + " idle="
+        logger.debug("Maestro group: " + spec + " hosts=" + fullGroup.size() + " idle="
                 + idleGroup.size() + " maxCoresTotal=" + maxCoresTotalInGroup + " candidates="
                 + candidates.size() + " wide(>100cores)=" + wideCount);
         if (candidates.isEmpty())
@@ -1305,7 +1303,7 @@ public class Scheduler extends JdbcDaoSupport {
      * line; 3. plan each group in priority order against one candidate query per group, placing
      * into the idle subset while a layer that cannot fit collects a reservation request; 4. grant
      * reservations, plan the bookings in parallel, trim to the folder and license limits, commit
-     * the survivors in one batch, and launch them. See planner.md for the full model.
+     * the survivors in one batch, and launch them. See maestro.md for the full model.
      *
      * @return frames committed this tick, or -1 for a standby that drained but did not plan.
      */
@@ -1317,19 +1315,19 @@ public class Scheduler extends JdbcDaoSupport {
 
         // Leadership gate: a backup has now drained and idles here; only the leader plans below.
         if (!ensureLeadership()) {
-            logger.debug("Scheduler: another Cuebot holds the planning lock");
+            logger.debug("Maestro: another Cuebot holds the planning lock");
             summaryLockLost++;
             return -1;
         }
 
         long tStart = System.currentTimeMillis();
-        SchedulerMetrics.TickStats stats = new SchedulerMetrics.TickStats();
+        MaestroMetrics.TickStats stats = new MaestroMetrics.TickStats();
         lastTickStats = stats;
         resetTickOutputs();
         try {
             dispatchSupport.sweepOrphanedProcs(10);
         } catch (RuntimeException e) {
-            logger.warn("Scheduler: orphan sweep failed: " + e);
+            logger.warn("Maestro: orphan sweep failed: " + e);
         }
         clearTickScratch();
 
@@ -1380,13 +1378,14 @@ public class Scheduler extends JdbcDaoSupport {
         // whose cores were never added, while the release path subtracts them regardless,
         // and four of the five mirrors have no repair job to undo that.
         final List<FrameBooking> toCommit = planned;
-        List<FrameBooking> committed = toCommit.isEmpty()
-                ? java.util.Collections.<FrameBooking>emptyList()
-                : txTemplate().execute(status -> {
-                    List<FrameBooking> won = dispatchSupport.startFramesAndProcsBatch(toCommit);
-                    applyResourceDeltas(won);
-                    return won;
-                });
+        List<FrameBooking> committed =
+                toCommit.isEmpty() ? java.util.Collections.<FrameBooking>emptyList()
+                        : txTemplate().execute(status -> {
+                            List<FrameBooking> won =
+                                    dispatchSupport.startFramesAndProcsBatch(toCommit);
+                            applyResourceDeltas(won);
+                            return won;
+                        });
         long tCommit = System.currentTimeMillis();
         // Monitoring events go out AFTER the commit transaction so a slow
         // publish can never extend the booking commit's lock window.
@@ -1396,7 +1395,7 @@ public class Scheduler extends JdbcDaoSupport {
         // holds the procs alive right now (booked minus drained). Filling it at
         // tick start would sample the post-drain trough, where a fast-completing
         // farm reads as empty every time.
-        if (schedulerMetrics != null && schedulerMetrics.isEnabled()) {
+        if (maestroMetrics != null && maestroMetrics.isEnabled()) {
             stats.coresByShow.putAll(showCoresLive);
             stats.runningFrames = runningFramesLive;
             if (farmHealth != null)
@@ -1406,7 +1405,7 @@ public class Scheduler extends JdbcDaoSupport {
         int dispatchedNow = committed.size();
         long tFlush = System.currentTimeMillis();
         if (tFlush - tStart > 1000) {
-            logger.info("Scheduler tick breakdown: place=" + (tPlan - tStart) + "ms, read="
+            logger.info("Maestro tick breakdown: place=" + (tPlan - tStart) + "ms, read="
                     + (tRead - tPlan) + "ms, batchCommit=" + (tCommit - tRead) + "ms, flush+launch="
                     + (tFlush - tCommit) + "ms | placements=" + lastPlacements + " planned="
                     + planned.size() + " committed=" + dispatchedNow);
@@ -1420,18 +1419,17 @@ public class Scheduler extends JdbcDaoSupport {
     /**
      * Read each planned placement's next frames and build procs in memory (no DB writes),
      * parallelized across hosts on the bounded read pool, the dominant tick cost as the farm fills.
-     * One task per host (not one thread), run at scheduler.read_pool_size concurrency: a host is
+     * One task per host (not one thread), run at maestro.read_pool_size concurrency: a host is
      * booked serially within its task because planHost decrements that host's idle fields as it
      * books, so a later layer sees what an earlier one took, and two tasks on one host would
      * double-book it; different hosts run concurrently. A layer that plans but yields zero bookable
-     * frames for plan_zero_warn_ticks ticks in a row is warned (a commit-time gate the planner does
-     * not model is silently rejecting it, which would otherwise starve in silence). Returns the
-     * planned bookings, or null if the wait was interrupted (the caller then aborts the tick before
+     * frames for plan_zero_warn_ticks ticks in a row is warned (a commit-time gate Maestro does not
+     * model is silently rejecting it, which would otherwise starve in silence). Returns the planned
+     * bookings, or null if the wait was interrupted (the caller then aborts the tick before
      * committing).
      */
     private List<FrameBooking> planBookings() {
-        int planZeroWarnTicks =
-                env.getProperty("scheduler.plan_zero_warn_ticks", Integer.class, 40);
+        int planZeroWarnTicks = env.getProperty("maestro.plan_zero_warn_ticks", Integer.class, 40);
         lastPlacements = 0;
         Set<String> plannedLayerIds = new HashSet<>();
         for (List<String> ls : plannedByHost.values()) {
@@ -1447,7 +1445,7 @@ public class Scheduler extends JdbcDaoSupport {
                 DispatchHost host = hostManager.getDispatchHost(hostId);
                 for (String layerId : layerIds) {
                     LayerInterface layer = jobManager.getLayer(layerId);
-                    // The rss resize the planner scored with, so the commit books the
+                    // The rss resize Maestro scored with, so the commit books the
                     // same shape. {cores, memKb}; absent = book the layer's own ask.
                     long[] rz = layerResize.get(layerId);
                     int[] slice = planSliceByHostLayer.get(hostId + "|" + layerId);
@@ -1457,12 +1455,12 @@ public class Scheduler extends JdbcDaoSupport {
                     if (got.isEmpty()) {
                         int streak = planZeroStreak.merge(layerId, 1, Integer::sum);
                         if (streak % planZeroWarnTicks == 0) {
-                            logger.warn("Scheduler: layer " + layerId + " planned " + streak
+                            logger.warn("Maestro: layer " + layerId + " planned " + streak
                                     + " consecutive ticks (last host " + host.getName()
                                     + ") but planHost found 0 bookable frames each time."
-                                    + " A dispatch-query gate the planner does not model is"
+                                    + " A dispatch-query gate Maestro does not model is"
                                     + " rejecting it (thread mode, limit, local booking, ...):"
-                                    + " enable DEBUG on this class and read the 'Scheduler"
+                                    + " enable DEBUG on this class and read the 'Maestro"
                                     + " unplaced'/'explain' lines for the candidate-side view.");
                         }
                     } else {
@@ -1481,7 +1479,7 @@ public class Scheduler extends JdbcDaoSupport {
                 try {
                     planned.addAll(f.get());
                 } catch (ExecutionException ee) {
-                    logger.debug("Scheduler: plan task failed: "
+                    logger.debug("Maestro: plan task failed: "
                             + (ee.getCause() != null ? ee.getCause().getMessage()
                                     : ee.getMessage()));
                 }
@@ -1490,7 +1488,7 @@ public class Scheduler extends JdbcDaoSupport {
             Thread.currentThread().interrupt();
             return null;
         }
-        // Streaks matter only while the planner keeps choosing the layer; drop entries for
+        // Streaks matter only while Maestro keeps choosing the layer; drop entries for
         // layers not planned this tick so the map tracks live pathologies, not vanished work.
         planZeroStreak.keySet().retainAll(plannedLayerIds);
         return planned;
@@ -1564,7 +1562,7 @@ public class Scheduler extends JdbcDaoSupport {
      * ledger (the show_cores gauge's only source: stats never query the database), then apply their
      * resource accounting deltas and flush one UPDATE per changed row.
      */
-    private void recordCommitted(List<FrameBooking> committed, SchedulerMetrics.TickStats stats) {
+    private void recordCommitted(List<FrameBooking> committed, MaestroMetrics.TickStats stats) {
         for (FrameBooking b : committed) {
             stats.framesByShow.merge(b.frame.show, 1, Integer::sum);
             bumpShowCoresLive(b.frame.show, b.proc.coresReserved / (double) CORE_POINTS_PER_CORE);
@@ -1616,15 +1614,15 @@ public class Scheduler extends JdbcDaoSupport {
                 try {
                     dispatchSupport.runFrame(fb.proc, fb.frame);
                 } catch (RuntimeException e) {
-                    logger.warn("Scheduler: RQD launch failed for " + fb.proc.getName()
-                            + " on frame " + fb.frame.getFrameId() + ": " + e.getMessage()
+                    logger.warn("Maestro: RQD launch failed for " + fb.proc.getName() + " on frame "
+                            + fb.frame.getFrameId() + ": " + e.getMessage()
                             + ", unbooking and clearing frame");
                     try {
                         dispatchSupport.unbookProc(fb.proc);
                         dispatchSupport.clearFrame(fb.frame);
                         rqdClient.killFrame(fb.proc, "launch failed during scheduler dispatch");
                     } catch (RuntimeException ce) {
-                        logger.debug("Scheduler: launch-failure cleanup partial for "
+                        logger.debug("Maestro: launch-failure cleanup partial for "
                                 + fb.frame.getFrameId() + ": " + ce.getMessage());
                     }
                 }
@@ -1659,7 +1657,7 @@ public class Scheduler extends JdbcDaoSupport {
             } catch (SQLException e) {
                 // treated as dead below
             }
-            logger.warn("Scheduler: planning-lock connection lost; demoting to standby");
+            logger.warn("Maestro: planning-lock connection lost; demoting to standby");
             closeLeaderConn();
             return false;
         }
@@ -1668,13 +1666,13 @@ public class Scheduler extends JdbcDaoSupport {
             conn = openLeaderConnection();
             if (acquireLeaderLock(conn)) {
                 leaderConn = conn;
-                logger.info("Scheduler: acquired planning leadership (sticky)");
+                logger.info("Maestro: acquired planning leadership (sticky)");
                 return true;
             }
             conn.close();
             return false;
         } catch (SQLException e) {
-            logger.warn("Scheduler: leadership probe failed: " + e.getMessage());
+            logger.warn("Maestro: leadership probe failed: " + e.getMessage());
             if (conn != null) {
                 try {
                     conn.close();
@@ -1742,7 +1740,7 @@ public class Scheduler extends JdbcDaoSupport {
         } catch (SQLException e) {
             // If the connection dropped, the backend session ended and the
             // lock was released automatically.
-            logger.debug("Scheduler: pg_advisory_unlock failed (probably connection drop): "
+            logger.debug("Maestro: pg_advisory_unlock failed (probably connection drop): "
                     + e.getMessage());
         }
     }
@@ -1884,18 +1882,18 @@ public class Scheduler extends JdbcDaoSupport {
     /** Log the explain rows for a group that produced no candidates. DEBUG-gated by the caller. */
     private void explainGroupExclusions(HostSpecKey spec, int maxCoresTotalInGroup) {
         getJdbcTemplate().query(EXPLAIN_GROUP_EXCLUSIONS, rs -> {
-            logger.debug("Scheduler explain " + spec + ": job=" + rs.getString("job_name")
-                    + " layer=" + rs.getString("layer_name") + " prio=" + rs.getInt("int_priority")
-                    + " tags='" + rs.getString("str_tags") + "' tagOk=" + rs.getBoolean("tag_ok")
-                    + " osOk=" + rs.getBoolean("os_ok") + " facOk=" + rs.getBoolean("fac_ok")
-                    + " threadOk=" + rs.getBoolean("thread_ok") + " hasSub="
-                    + rs.getBoolean("has_sub") + " underBurst=" + rs.getBoolean("under_burst")
-                    + " underJobCap=" + rs.getBoolean("under_job_cap") + " fitsCores="
-                    + rs.getBoolean("fits_cores") + " hasWaiting=" + rs.getBoolean("has_waiting")
-                    + " limitOk=" + rs.getBoolean("limit_ok") + " folderOk="
-                    + rs.getBoolean("folder_ok") + " managedOk=" + rs.getBoolean("managed_ok"));
+            logger.debug("Maestro explain " + spec + ": job=" + rs.getString("job_name") + " layer="
+                    + rs.getString("layer_name") + " prio=" + rs.getInt("int_priority") + " tags='"
+                    + rs.getString("str_tags") + "' tagOk=" + rs.getBoolean("tag_ok") + " osOk="
+                    + rs.getBoolean("os_ok") + " facOk=" + rs.getBoolean("fac_ok") + " threadOk="
+                    + rs.getBoolean("thread_ok") + " hasSub=" + rs.getBoolean("has_sub")
+                    + " underBurst=" + rs.getBoolean("under_burst") + " underJobCap="
+                    + rs.getBoolean("under_job_cap") + " fitsCores=" + rs.getBoolean("fits_cores")
+                    + " hasWaiting=" + rs.getBoolean("has_waiting") + " limitOk="
+                    + rs.getBoolean("limit_ok") + " folderOk=" + rs.getBoolean("folder_ok")
+                    + " managedOk=" + rs.getBoolean("managed_ok"));
         }, spec.tagsNormalized, spec.os, spec.pkFacility, spec.allThreadMode ? 1 : 0,
-                maxCoresTotalInGroup, SchedulerMode.facility(env), spec.pkAlloc);
+                maxCoresTotalInGroup, MaestroMode.facility(env), spec.pkAlloc);
     }
 
     /**
@@ -1906,7 +1904,7 @@ public class Scheduler extends JdbcDaoSupport {
      * so this costs nothing but a walk of the list. Budgets are the part that touches the database
      * (the in-flight term), so they are derived once per license per tick: a pool named by an
      * earlier group is reused by every later one, which also keeps the numbers consistent across
-     * groups within a tick. Both maps are tick-scoped and planner-thread only.
+     * groups within a tick. Both maps are tick-scoped and Maestro-thread only.
      */
     private void resolveLicenseBudgets(List<LayerCandidate> candidates,
             Map<String, List<String>> layerLicenses,
@@ -1961,14 +1959,13 @@ public class Scheduler extends JdbcDaoSupport {
 
     /* package for tests */ List<LayerCandidate> readLayerCandidatesForGroup(HostSpecKey spec,
             int maxIdleInGroup) {
-        int limit =
-                env.getProperty("scheduler.layer_candidates_per_group_max", Integer.class, 2000);
+        int limit = env.getProperty("maestro.layer_candidates_per_group_max", Integer.class, 2000);
         LicenseSource ls = licenseSource;
         String licenseKey = (ls != null) ? ls.getEnvKey() : "CUE_LICENSES";
         List<LayerCandidate> rows =
                 getJdbcTemplate().query(SELECT_CANDIDATES_FOR_GROUP, CANDIDATE_MAPPER, spec.pkAlloc,
                         licenseKey, spec.os, spec.pkFacility, spec.allThreadMode ? 1 : 0,
-                        spec.tagsNormalized, maxIdleInGroup, SchedulerMode.facility(env), limit);
+                        spec.tagsNormalized, maxIdleInGroup, MaestroMode.facility(env), limit);
         // Defensive dedupe: nothing in the schema forbids two layer_env rows
         // with the same key, and a duplicated row would clone its candidate
         // (double placement per tick). First row per layer wins.
@@ -2050,7 +2047,7 @@ public class Scheduler extends JdbcDaoSupport {
      * contribute nothing.
      */
     private static void aggregateFarmHealth(Map<HostSpecKey, List<BookableHost>> groups,
-            Map<String, FarmHealth.HostHealth> health, SchedulerMetrics.TickStats stats) {
+            Map<String, FarmHealth.HostHealth> health, MaestroMetrics.TickStats stats) {
         for (Map.Entry<HostSpecKey, List<BookableHost>> e : groups.entrySet()) {
             HostSpecKey k = e.getKey();
             String groupLabel = k.tagsNormalized + (k.hasGpu ? " gpu" : "") + "|" + k.os;
@@ -2060,10 +2057,9 @@ public class Scheduler extends JdbcDaoSupport {
                     continue;
                 String shape = (h.coresTotal / 100) + "c/"
                         + Math.round(h.memTotal / (1024.0 * 1024.0)) + "g";
-                stats.healthByGroup
-                        .computeIfAbsent(groupLabel, x -> new SchedulerMetrics.HealthAgg())
+                stats.healthByGroup.computeIfAbsent(groupLabel, x -> new MaestroMetrics.HealthAgg())
                         .add(hh.swapTotalKb, hh.swapFreeKb, hh.sysTimePct);
-                stats.healthByHwtype.computeIfAbsent(shape, x -> new SchedulerMetrics.HealthAgg())
+                stats.healthByHwtype.computeIfAbsent(shape, x -> new MaestroMetrics.HealthAgg())
                         .add(hh.swapTotalKb, hh.swapFreeKb, hh.sysTimePct);
             }
         }
@@ -2161,9 +2157,8 @@ public class Scheduler extends JdbcDaoSupport {
             c.jobCoresInUse = jobCoresUsed.computeIfAbsent(c.jobId, k -> c.jobCoresInUse);
             // Keyed on the subscription, not the show: a show with two allocations has
             // two bursts, and the candidate row carries this group's own sub.int_cores.
-            c.showCoresInUse =
-                    showCoresUsed.computeIfAbsent(subKey(c.showId, groupAllocId),
-                            k -> c.showCoresInUse);
+            c.showCoresInUse = showCoresUsed.computeIfAbsent(subKey(c.showId, groupAllocId),
+                    k -> c.showCoresInUse);
             // Seed this limit's tick-wide running count from the farm-wide count
             // the first time it is seen this tick (candidate query already
             // excluded limits that were full at query time; this catches a limit
@@ -2369,7 +2364,7 @@ public class Scheduler extends JdbcDaoSupport {
                         if (b.hostBased) {
                             Set<String> seats = licenseSeats.get(licName);
                             if (seats.add(best.hostName.toLowerCase())) {
-                                logger.info("Scheduler license: new seat " + seats.size() + "/"
+                                logger.info("Maestro license: new seat " + seats.size() + "/"
                                         + b.seatCap + " on host " + best.hostName + " for license "
                                         + licName);
                             }
@@ -2427,7 +2422,7 @@ public class Scheduler extends JdbcDaoSupport {
                     why = "noFittingIdleHost(seat-gated pools present)";
                 else
                     why = "noFittingIdleHost";
-                logger.debug("Scheduler unplaced: layer=" + c.layerId + " prio=" + c.priority
+                logger.debug("Maestro unplaced: layer=" + c.layerId + " prio=" + c.priority
                         + " cores=" + c.layerCoresMin + " memKb=" + c.layerMemMin + " waiting="
                         + c.waitingFrameCount + " why=" + why);
             }
@@ -2474,7 +2469,7 @@ public class Scheduler extends JdbcDaoSupport {
                 // Trace reservation decisions for every candidate so we can
                 // see why wide-job layers never accumulate enough debt.
                 if (logger.isDebugEnabled()) {
-                    logger.debug("Scheduler resv-candidate: layer=" + c.layerId + " coresMin="
+                    logger.debug("Maestro resv-candidate: layer=" + c.layerId + " coresMin="
                             + c.layerCoresMin + " waiting=" + c.waitingFrameCount + " capped="
                             + capped + " placed=" + placed + " blocked=" + blocked + " debt=" + debt
                             + "ms threshold=" + reservationBlockMs + "ms" + " wide=" + wideEnough
@@ -2741,7 +2736,7 @@ public class Scheduler extends JdbcDaoSupport {
      * dimensions of each dimension's convex cost rise from adding one frame (see deltaCost).
      * Because the terms are e^(used/total), an already-full dimension (idle cores behind saturated
      * memory) costs far more, and the utilization-fraction exponent keeps the score size-unbiased
-     * so big hosts are not starved. We pick the host with the smallest score. See planner.md for
+     * so big hosts are not starved. We pick the host with the smallest score. See maestro.md for
      * the derivation and the farm-balancing properties.
      *
      * One-step lookahead: the cost adds just this frame, not an end-of-tick projection. The
@@ -2905,7 +2900,7 @@ public class Scheduler extends JdbcDaoSupport {
     // ---- plan / batch-commit: submission ----------------------------------
 
     /**
-     * Record a (host, layer) placement to commit at the end of this tick. Planner-thread only;
+     * Record a (host, layer) placement to commit at the end of this tick. Maestro-thread only;
      * doTick drains plannedByHost via planHost + startFramesAndProcsBatch.
      */
     private void submitCommit(String hostId, String layerId, int estFrames) {
@@ -2921,7 +2916,7 @@ public class Scheduler extends JdbcDaoSupport {
     // ---- batched resource accounting: accumulate + flush ------------------
 
     /**
-     * Record the resource deltas for the procs the batch commit just booked. Called on the planner
+     * Record the resource deltas for the procs the batch commit just booked. Called on Maestro
      * thread right after startFramesAndProcsBatch. The passed list is the batch's winners (only
      * successfully committed procs), so rolled-back bookings are never counted. Local dispatches
      * keep their own accounting path and are skipped here.
@@ -2960,9 +2955,9 @@ public class Scheduler extends JdbcDaoSupport {
     }
 
     /**
-     * Apply this tick's accumulated resource deltas as one UPDATE per row. Runs on the planner
-     * thread right after the batch commit, so no accumulation races it. On a SQL error the deltas
-     * are merged back so the next tick retries them rather than silently dropping accounting.
+     * Apply this tick's accumulated resource deltas as one UPDATE per row. Runs on Maestro thread
+     * right after the batch commit, so no accumulation races it. On a SQL error the deltas are
+     * merged back so the next tick retries them rather than silently dropping accounting.
      * Subscription/layer rows missing (deleted mid-tick) simply update zero rows; folder/point use
      * the job subquery and likewise no-op if the job is gone.
      */
@@ -2993,7 +2988,7 @@ public class Scheduler extends JdbcDaoSupport {
         // unchanged, so an admin shrinking a busy subscription would wedge
         // this flush forever. Each statement below touches int_burst, the
         // trigger's WHEN clause skips both, and burst is net unchanged at
-        // commit. Burst enforcement stays in the planner at plan time.
+        // commit. Burst enforcement stays in Maestro at plan time.
         getJdbcTemplate().batchUpdate("UPDATE subscription SET int_burst = int_burst + ? "
                 + "WHERE pk_show = ? AND pk_alloc = ?", burstBatch);
         getJdbcTemplate().batchUpdate("UPDATE subscription SET int_cores = int_cores + ?, "
@@ -3037,15 +3032,13 @@ public class Scheduler extends JdbcDaoSupport {
         // int_cores while int_max_cores stays unchanged; when a user lowers a
         // running job's max under load, that rejection aborts the whole batch
         // and the mirror drifts (the CAPDROP verify scenario reproduces this).
-        // Cap ENFORCEMENT is the planner's job at plan time; this mirror must
+        // Cap ENFORCEMENT is Maestro's job at plan time; this mirror must
         // always record reality. Each statement below also touches
         // int_max_cores, so the trigger's WHEN clause skips both, and max is
         // net unchanged at commit. Leans on that WHEN clause (V11: fires only
         // on cores-up with max unchanged) by design.
-        getJdbcTemplate().batchUpdate(
-                "UPDATE job_resource SET int_max_cores = int_max_cores + ?, "
-                        + "int_max_gpus = int_max_gpus + ? WHERE pk_job = ?",
-                jobBatch);
+        getJdbcTemplate().batchUpdate("UPDATE job_resource SET int_max_cores = int_max_cores + ?, "
+                + "int_max_gpus = int_max_gpus + ? WHERE pk_job = ?", jobBatch);
         getJdbcTemplate().batchUpdate("UPDATE job_resource SET int_cores = int_cores + ?, "
                 + "int_max_cores = int_max_cores - ?, int_gpus = int_gpus + ?, "
                 + "int_max_gpus = int_max_gpus - ? WHERE pk_job = ?", pairBatch);
@@ -3054,11 +3047,12 @@ public class Scheduler extends JdbcDaoSupport {
                         + "int_gpus = int_gpus + ? "
                         + "WHERE pk_folder = (SELECT pk_folder FROM job WHERE pk_job = ?)",
                 jobBatch);
-        getJdbcTemplate().batchUpdate(
-                "UPDATE point SET int_cores = int_cores + ?, int_gpus = int_gpus + ? "
-                        + "WHERE pk_dept = (SELECT pk_dept FROM job WHERE pk_job = ?) "
-                        + "AND pk_show = (SELECT pk_show FROM job WHERE pk_job = ?)",
-                pointBatch);
+        getJdbcTemplate()
+                .batchUpdate(
+                        "UPDATE point SET int_cores = int_cores + ?, int_gpus = int_gpus + ? "
+                                + "WHERE pk_dept = (SELECT pk_dept FROM job WHERE pk_job = ?) "
+                                + "AND pk_show = (SELECT pk_show FROM job WHERE pk_job = ?)",
+                        pointBatch);
     }
 
     /** Copy out the current deltas and clear the buffer for the next tick. */
@@ -3172,7 +3166,7 @@ public class Scheduler extends JdbcDaoSupport {
      * waitlist the tick actually weighed. Loop-only by design (no extra query): a job the candidate
      * query already filters out at its cap surfaces here only on the ticks churn re-admits it.
      */
-    private void tallyWaitlist(SchedulerMetrics.TickStats stats) {
+    private void tallyWaitlist(MaestroMetrics.TickStats stats) {
         Map<String, Long> w = stats.waitingFramesByReason;
         for (Map.Entry<String, String> e : waitReasonByLayer.entrySet()) {
             Integer frames = waitFramesByLayer.get(e.getKey());
@@ -3191,7 +3185,7 @@ public class Scheduler extends JdbcDaoSupport {
     // ---- config -----------------------------------------------------------
 
     private boolean isEnabled() {
-        return SchedulerMode.enabled(env);
+        return MaestroMode.enabled(env);
     }
 
     // ---- POJOs ------------------------------------------------------------
@@ -3396,7 +3390,7 @@ public class Scheduler extends JdbcDaoSupport {
         this.frameCompleteHandler = h;
     }
 
-    public void setSchedulerMetrics(SchedulerMetrics m) {
-        this.schedulerMetrics = m;
+    public void setMaestroMetrics(MaestroMetrics m) {
+        this.maestroMetrics = m;
     }
 }

@@ -120,7 +120,7 @@ def psql_cmd(tab=False):
 # because the tag confines it. That supply/demand imbalance strands cores and
 # drops utilization (balanced/uniform tags do NOT: each pool is then a balanced
 # mini-farm that just saturates on its own). It also multiplies the host-spec
-# groups the planner scans. Matching is still enforced by cuebot's dispatch query
+# groups Maestro scans. Matching is still enforced by cuebot's dispatch query
 # (no scheduler change).
 NTAGS = int(os.environ.get("SIM_NTAGS", "0") or "0")
 TAGS_ON = NTAGS >= 2
@@ -142,7 +142,7 @@ MULTITAG_FRAC = float(os.environ.get("SIM_MULTITAG_FRAC", "0") or "0")
 # general-queue job that any host can run. 'general' is on EVERY host, so such a
 # layer is a candidate in EVERY host-spec group at once. That is the realistic
 # case (most work is untagged) and, with many tags, the maximal stress on the
-# planner: one run-anywhere layer is scanned/planned once per group per tick. 0
+# Maestro: one run-anywhere layer is scanned/planned once per group per tick. 0
 # (default) = every layer is confined to a capability pool.
 GENERAL_FRAC = float(os.environ.get("SIM_GENERAL_FRAC", "0") or "0")
 

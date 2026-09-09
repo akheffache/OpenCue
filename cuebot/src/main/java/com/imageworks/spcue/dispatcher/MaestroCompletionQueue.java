@@ -29,9 +29,9 @@ import org.apache.logging.log4j.Logger;
  * completion queue first on every pass, accounting rolled into one transaction).
  *
  * Frame-complete reports used to be processed on the gRPC threads that received them: dozens of
- * concurrent writers racing each other and the planner over the same rows. Two duplicate reports
+ * concurrent writers racing each other and Maestro over the same rows. Two duplicate reports
  * interleaving with a job shutdown could throw mid-processing and leave an ORPHANED proc behind
- * (its frame back to WAITING, the proc row never deleted), and one such orphan wedges the planner's
+ * (its frame back to WAITING, the proc row never deleted), and one such orphan wedges Maestro's
  * batch commit permanently. The fix is architectural: the report thread only ACKS, RESOLVES (pure
  * reads) AND ENQUEUES here, and the scheduler tick drains the queue single-threaded before
  * planning, so completion WRITES and planning are one writer, in one place, in tick order. The
@@ -46,13 +46,13 @@ import org.apache.logging.log4j.Logger;
  * requeues it, and the frame is redone. A few seconds of redone work beats any at-least-once
  * machinery.
  *
- * Static singleton on purpose: the enqueue side (FrameCompleteHandler) and the drain side
- * (Scheduler) are wired in different Spring contexts of the same process, and this queue is
- * process-local state with no configuration, so Spring plumbing would add wiring for nothing.
+ * Static singleton on purpose: the enqueue side (FrameCompleteHandler) and the drain side (Maestro)
+ * are wired in different Spring contexts of the same process, and this queue is process-local state
+ * with no configuration, so Spring plumbing would add wiring for nothing.
  */
-public final class SchedulerCompletionQueue {
+public final class MaestroCompletionQueue {
 
-    private static final Logger logger = LogManager.getLogger(SchedulerCompletionQueue.class);
+    private static final Logger logger = LogManager.getLogger(MaestroCompletionQueue.class);
 
     /**
      * Hard cap on queued completions. At the default 3s tick a full farm completes a few thousand
@@ -66,14 +66,14 @@ public final class SchedulerCompletionQueue {
     private static final AtomicInteger SIZE = new AtomicInteger(0);
     private static final AtomicLong DROPPED = new AtomicLong(0);
 
-    private SchedulerCompletionQueue() {}
+    private MaestroCompletionQueue() {}
 
     /** Ack-path enqueue. Never blocks, never throws; over the cap the completion is dropped. */
     public static void offer(QueuedFrameCompletion completion) {
         if (SIZE.get() >= MAX_QUEUED) {
             long n = DROPPED.incrementAndGet();
             if (n % 1000 == 1) {
-                logger.warn("SchedulerCompletionQueue full (" + MAX_QUEUED
+                logger.warn("MaestroCompletionQueue full (" + MAX_QUEUED
                         + "); dropping completion for " + "frame " + completion.frame.getName()
                         + " (total dropped " + n + "); host-report reconciliation will requeue it");
             }

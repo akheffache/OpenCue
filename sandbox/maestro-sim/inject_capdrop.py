@@ -1,9 +1,9 @@
 """CAPDROP test injector: reproduce a user lowering a job's max cores under load.
 
 Floods the farm with a few DEEP 1-core jobs (generous max cores, no limits), so the
-planner books one job wide across the farm. The companion capdrop_watch.py then
+Maestro books one job wide across the farm. The companion capdrop_watch.py then
 lowers the busiest job's int_max_cores BELOW its live usage, exactly what a user
-does in production with "set max cores" on a running job. The planner's next
+does in production with "set max cores" on a running job. Maestro's next
 accounting flush for that job arrives over the new cap, and the legacy
 verify_job_resources trigger rejects it; the watcher asserts the accounting mirror
 (job_resource.int_cores) still tracks the truth (SUM of the job's procs).

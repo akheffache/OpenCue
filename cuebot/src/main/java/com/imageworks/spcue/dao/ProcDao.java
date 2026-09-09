@@ -99,9 +99,9 @@ public interface ProcDao {
     /**
      * Batch variant of {@link #insertVirtualProc}: inserts many procs in one round-trip. Does NOT
      * touch host idle resources (those are reserved up-front by {@link #reserveHostResourcesBatch})
-     * nor the subscription/layer/job/folder/point counters, the Scheduler batches those separately.
-     * Each proc is assigned a fresh id. Intended for the Scheduler's batch commit path, where the
-     * frames were already won via a version-guarded update so duplicate inserts cannot occur.
+     * nor the subscription/layer/job/folder/point counters, Maestro batches those separately. Each
+     * proc is assigned a fresh id. Intended for Maestro's batch commit path, where the frames were
+     * already won via a version-guarded update so duplicate inserts cannot occur.
      *
      * @param procs the procs to insert (non-local)
      */
@@ -111,8 +111,8 @@ public interface ProcDao {
      * Atomically reserve each host's aggregated idle-resource share for this tick's procs, using a
      * guarded decrement that only books a host that currently has room for its whole share. Returns
      * the set of host ids that had room (were decremented); procs on any other host must NOT be
-     * booked. This is what keeps the Scheduler from sending a proc to a host that cannot hold it:
-     * an unguarded decrement would drive idle negative, trip the verify_host_resources trigger, and
+     * booked. This is what keeps Maestro from sending a proc to a host that cannot hold it: an
+     * unguarded decrement would drive idle negative, trip the verify_host_resources trigger, and
      * abort the whole batched tick.
      *
      * @param procs the procs whose hosts to reserve (non-local)
@@ -131,8 +131,8 @@ public interface ProcDao {
 
     /**
      * Delete any proc rows sitting on the given frames and return them with their host and reserved
-     * resources, so the caller can refund the hosts. Used by the planner's batch commit right after
-     * it wins a frame's WAITING to RUNNING transition: a proc still attached to such a frame is
+     * resources, so the caller can refund the hosts. Used by Maestro's batch commit right after it
+     * wins a frame's WAITING to RUNNING transition: a proc still attached to such a frame is
      * provably stale (a crash or a failed completion left it behind), and inserting the new proc
      * would otherwise hit c_proc_uk and wedge the whole batch.
      *

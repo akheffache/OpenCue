@@ -1,23 +1,23 @@
 ---
-title: "Planner Scheduler"
-linkTitle: "Planner Scheduler"
+title: "OpenCue Maestro"
+linkTitle: "OpenCue Maestro"
 parent: "Developer Guide"
 nav_order: 103
 layout: default
 date: 2026-08-28
 description: >
-  Design and operation of the whole-farm planner scheduler
+  Design and operation of OpenCue Maestro, the whole-farm scheduler
 ---
 
-# Scheduler (Planner)
+# OpenCue Maestro
 
-A whole-farm scheduler for OpenCue, gated behind `scheduler.enabled`
+OpenCue Maestro is a whole-farm scheduler, gated behind `maestro.enabled`
 (default **off**). It is an alternative to the legacy per-host dispatcher.
 When enabled it owns dispatch and the legacy `BookingQueue` path is
 suppressed. Placement decisions are made single-threaded over an in-memory
 snapshot; only the per-host plan reads run in parallel (see section 4).
 
-The keystone of the design is that the planner is **stateless between ticks**:
+The keystone of the design is that Maestro is **stateless between ticks**:
 each tick re-derives its entire picture from a fresh database snapshot and keeps
 no booking state across ticks — the database is the single source of truth.
 Fire-and-forget launches, instant failover, and self-healing after a crash all
@@ -45,13 +45,13 @@ scheduling, following a hand-maintained, per-show rulebook.
 A **scheduler** makes those decisions itself. It takes a snapshot of the
 whole farm each cycle, scores every candidate placement by how much
 capacity it would strand, holds reservations for work that would otherwise
-starve, and books accordingly. That is what this component does.
+starve, and books accordingly. That is what Maestro does.
 
 ---
 
 ## 2. Architecture: the tick loop
 
-The scheduler runs a periodic tick (`runTick` → `doTick`). Every Cuebot, leader
+Maestro runs a periodic tick (`runTick` → `doTick`). Every Cuebot, leader
 or not, first drains any queued frame-completions (`drainResolvedCompletions`)
 and expires displaced cache-warmth, self-healing that must run regardless of who
 holds the lock. A **leadership gate** follows: only the Cuebot holding the
@@ -89,10 +89,10 @@ single batched commit and the launches fire afterward fire-and-forget.
 
 ### The keystone: stateless between ticks
 
-The planner holds **no durable booking state**. Each tick rebuilds its world from
+Maestro holds **no durable booking state**. Each tick rebuilds its world from
 the fresh host snapshot (step 1) and the per-group candidate queries (step 3); the
 only thing carried across ticks is the soft reservation map, and even that is just
-a hint the planner rebuilds from the database within a tick or two. **The database
+a hint Maestro rebuilds from the database within a tick or two. **The database
 is the single source of truth.** Three properties fall out of that one decision —
 and they are why the rest of the design stays simple:
 
@@ -114,11 +114,11 @@ That is the deliberate trade: **pay a re-read each tick in order to own no state
 
 ### Operational footprint
 
-Owning no durable state keeps the planner small and cheap to run. It lives
+Owning no durable state keeps Maestro small and cheap to run. It lives
 **inside Cuebot** — no new deploy unit, no separate service to run or fail over,
 and no new infrastructure. It is gated by a single flag
-(`scheduler.enabled`) and rolled back by flipping that flag off. The whole thing
-is ~3,700 lines, almost all in a handful of new files (the planner and its
+(`maestro.enabled`) and rolled back by flipping that flag off. The whole thing
+is ~3,700 lines, almost all in a handful of new files (Maestro and its
 helpers, this doc, and a test), with ~16 existing files lightly touched. There is nowhere to
 keep live state, no process to run it, and nothing to rebuild on failover — the
 database it already uses is the only state there is.
@@ -145,7 +145,7 @@ gpu memory):
 
 | Symbol | Meaning |
 |---|---|
-| `W_D` | weight of dimension `D`; configurable via `scheduler.score_weight_{cores,mem,gpus,gpu_mem}`, defaults `W_CORES=1`, `W_MEM=1`, `W_GPUS=4`, `W_GPU_MEM=1` |
+| `W_D` | weight of dimension `D`; configurable via `maestro.score_weight_{cores,mem,gpus,gpu_mem}`, defaults `W_CORES=1`, `W_MEM=1`, `W_GPUS=4`, `W_GPU_MEM=1` |
 | `total_D` | the host's total capacity in `D` |
 | `idle_D` | the host's capacity in `D` not reserved yet |
 | `before_D`, `after_D` | reserved amount in `D` before / after adding this frame |
@@ -157,7 +157,7 @@ We pick the host with the smallest score. Because the exponent is the
 free of host-size bias, and the convex `e^x` makes a dimension that is
 already near-full (e.g. a host with idle cores but saturated memory) cost a
 great deal more to load further. Default weights (tunable via the
-`scheduler.score_weight_*` properties): `W_CORES=1`, `W_MEM=1`,
+`maestro.score_weight_*` properties): `W_CORES=1`, `W_MEM=1`,
 `W_GPUS=4`, `W_GPU_MEM=1`, cores and memory equal; GPUs weighted higher so a
 GPU layer strands the least GPU capacity.
 
@@ -172,9 +172,9 @@ frames of a 16-core host instead of sitting idle.
 **Co-locality.** The score also carries a locality bonus. The legacy reactive
 path rebooked the next frame of a job onto the same proc the instant a frame
 finished, keeping a job's frames together on a machine (cache coherence:
-textures, geometry, KSM-shared pages, warm filesystem cache). The planner
+textures, geometry, KSM-shared pages, warm filesystem cache). Maestro
 unbooks a completing proc instead, so to preserve that it subtracts
-`scheduler.locality_bonus` (default 8.0) from a host's score when the host
+`maestro.locality_bonus` (default 8.0) from a host's score when the host
 already runs at least one frame of the candidate's layer, read once per tick
 as a host->layer affinity map (`readHostLayerAffinity`). A freed core is then
 preferentially refilled by the same layer on the next tick, so a layer stays
@@ -184,7 +184,7 @@ so the signal persists without tracking individual completions. The bonus is
 sized to outweigh the marginal stranding terms (which are ~e^util, single
 digits) but it is applied AFTER fit and reservation filtering, so it can never
 place a frame that does not fit or override a reservation. Disable with
-`scheduler.locality_enabled=false`. When a host loses its LAST proc of a
+`maestro.locality_enabled=false`. When a host loses its LAST proc of a
 layer this live signal disappears; the cache-warmth window (§3.7) carries it
 across the gap.
 
@@ -198,7 +198,7 @@ Maui): give the blocked wide job a future claim on a host, let that host
 drain toward it, and let shorter low-priority work run on the draining host
 in the meantime as long as it finishes before the host is needed.
 
-The planner implements this with four guards so reservations never freeze the
+Maestro implements this with four guards so reservations never freeze the
 farm reserved-but-idle (the classic low-utilization failure mode of naive
 conservative backfill):
 
@@ -219,7 +219,7 @@ conservative backfill):
   This gate is not configurable.
 - **Capacity cap.** Reservations may hold at most `reservationMaxFraction`
   (default 0.5) of the hosts that can fit the layer, and at most
-  `scheduler.reservation_max_grantees` (default 8) distinct layers may hold
+  `maestro.reservation_max_grantees` (default 8) distinct layers may hold
   reservations farm-wide. So a class of machines can never be fully reserved,
   and the farm cannot deadlock on reservations.
 - **Priority-weighted lottery grant (anti-starvation).** Grantees are drawn in
@@ -268,7 +268,7 @@ the big job" practice.
 
 ### 3.3 Plan reads and batched commit
 
-The planner never writes bookings during placement; it just records the
+Maestro never writes bookings during placement; it just records the
 `(host, layer)` pairings it chose. After all groups, `doTick` reads each
 pairing's frames in parallel by host (`planHost`, read-only, on a small read
 pool), then writes every booking for the tick in one batched transaction
@@ -277,9 +277,9 @@ Frames lost to a `frame.int_version` race are dropped from the batch and retried
 next tick. The RQD launches fire afterward fire-and-forget on a launch pool, so
 a slow RQD never stalls the tick. Each frame reserves exactly the layer's requested cores: `planHost` builds
 procs with the dispatcher's thread-mode idle-core expansion (grab-idle) turned
-off, so the cores committed match the cores the planner scored and decremented.
+off, so the cores committed match the cores Maestro scored and decremented.
 Grab-idle would silently reserve more than planned and corrupt the snapshot;
-the planner fills hosts by planning several placements, not by one frame
+Maestro fills hosts by planning several placements, not by one frame
 ballooning to consume the box.
 
 This keeps the *decisions* on one thread (no races) while parallelizing the part
@@ -291,8 +291,8 @@ one batched, atomic commit.
 Only one Cuebot may plan at a time, and leadership is **sticky**: the first
 Cuebot to take the Postgres advisory lock holds it for its whole life, on a
 dedicated non-pooled connection (HikariCP would reap a pooled one and silently
-drop the lock). Extra Cuebots are warm **backups**, not load sharing — the
-planner is a single writer, so more Cuebots cannot speed planning, and
+drop the lock). Extra Cuebots are warm **backups**, not load sharing — Maestro
+is a single writer, so more Cuebots cannot speed planning, and
 re-electing per tick only redid farm-wide work in N places. A standby probes
 the lock each tick and takes over only when the holder's session dies
 (Postgres releases the lock automatically), i.e. real failover. A new leader
@@ -361,8 +361,8 @@ so only the server knows what is free.
 `LicenseSource` polls a site provider off the hot path, on every Cuebot (so a
 promoted standby is warm):
 
-    scheduler.license.provider=http://lic-reporter:9101/licenses
-    scheduler.license.provider=script:/site/bin/cue_licenses.sh
+    maestro.license.provider=http://lic-reporter:9101/licenses
+    maestro.license.provider=script:/site/bin/cue_licenses.sh
 
 Either flavour returns the same JSON:
 
@@ -383,7 +383,7 @@ per machine (**host_based**: all frames on a seated machine share its one
 checkout, and a per-pool seat bonus packs licensed work onto the fewest
 machines).
 
-The planner corrects the always-stale sample before spending it: it subtracts
+Maestro corrects the always-stale sample before spending it: it subtracts
 **in-flight** (our own frames started since the sample, derived from the
 database so any Cuebot computes the same numbers — what makes licensing survive
 failover) and per-license **headroom** (seats kept for interactive users).
@@ -394,7 +394,7 @@ like folder ceilings). Stale sample, unknown license, or no provider while a
 layer asks for one: that work is **held**, never run blind.
 
 A frame that exits with a status listed in
-`scheduler.license.denied_exit_statuses` (a site's render wrapper maps the
+`maestro.license.denied_exit_statuses` (a site's render wrapper maps the
 vendor's "no license" signal to a sentinel code) is requeued WAITING without
 spending a retry, so a busy pool never marches a layer to DEAD.
 
@@ -414,12 +414,12 @@ The fix keeps a decayed pull on vacated `(host, layer)` pairs:
 
 **Age is displacement, not wall clock.** What invalidates a local cache is
 other layers' frames writing their data over yours. So age is counted in
-frames of *other* work booked onto the host since the layer left it: the
-scheduler keeps a per-host booking odometer, each warmth entry stores the
+frames of *other* work booked onto the host since the layer left it:
+Maestro keeps a per-host booking odometer, each warmth entry stores the
 odometer reading when the layer last completed there, and the difference is
 the age. A host that idles moves no odometer — its entries stay fully warm
 forever, because nothing displaced them. The map is fed by the completion
-drain (§4) and read only on the planner thread; the same odometer comparison
+drain (§4) and read only on the planning thread; the same odometer comparison
 expires entries, so the map is self-cleaning and bounded by
 `hosts x co-resident layers` (a few MB at worst). Added cost per tick is
 linear in completions + bookings + map size; scoring pays one hash lookup per
@@ -453,20 +453,20 @@ affinity reached ~90% (floor 15%) with POISON and the throughput gates
 unaffected.
 
 The window is a site property — your cache size over a typical frame's cache
-footprint — hence the `scheduler.locality_window_frames` knob (default 64,
+footprint — hence the `maestro.locality_window_frames` knob (default 64,
 0 disables). Known simplification: displacement counts frames, not bytes; if
 production data ever shows the average too coarse, the odometer can weight
 each booking by its memory reservation instead of counting 1.
 
 **The dial.** One counter reports both localities in production:
-`cue_scheduler_booked_frames_locality_total{kind}`, counted in planned frames
+`cue_maestro_booked_frames_locality_total{kind}`, counted in planned frames
 at each booking decision from the very signals the bonus scored. `live_warm`
 is locality in space (the chosen host runs the layer right now), `cache_warm`
 is locality in time (the layer left the host but the warmth window still
 holds), `cold` means the asset fetch is paid again. Warm kinds over the sum
 is placement's cache-hit rate — the number the sim's locality watcher
 measures from the outside; with the bonus off the same counter shows the
-accidental rate, the A/B baseline. Like every scheduler stat it issues no
+accidental rate, the A/B baseline. Like every Maestro stat it issues no
 SQL: three map lookups against the tick's own snapshots.
 
 ---
@@ -483,7 +483,7 @@ mismatch worth investigating. `limit` = a job, show, limit or folder cap.
 `no license` = a pool is exhausted or stale. `held` = every fitting host is
 reserved for a wide job. The buckets reuse the why-not precedence
 (`waitlistReason`), cost no extra query, and are published as the gauge
-`cue_scheduler_waiting_frames{reason}`. The "What's holding frames" Grafana
+`cue_maestro_waiting_frames{reason}`. The "What's holding frames" Grafana
 panel shows each BLOCKED bucket as a share of the weighed waitlist: all zero
 means everything flows, and `flowing` is the empty space below 100%. The stat
 line carries a `waitlist ...` section with the window's PEAK per bucket, so a
@@ -502,7 +502,7 @@ a group with nothing waiting strands nothing: idle without demand is just
 idle. Sustained growth means the farm's idle is the wrong shape for the
 waiting work.
 
-House rule for every scheduler metric: stats gather NO SQL, only live data the
+House rule for every Maestro metric: stats gather NO SQL, only live data the
 tick already holds. The waitlist reuses the loop's own verdicts, and the
 `show_cores` gauge is a live ledger (plus on the batch commit, minus on the
 drain; a show that drains to zero drops out), not a query over procs.
@@ -514,7 +514,7 @@ A few frames exhaust a host's memory and the rest of its cores sit idle but
 unbookable. PSTs used to fix it by hand, watching each task's rss and editing
 the layer mid-job; this feature is that loop inside the scheduler. It has no
 configuration beyond one policy ratio: constants live in the code, and the
-metric either derives from the farm or is pinned by `scheduler.mem_per_core`.
+metric either derives from the farm or is pinned by `maestro.mem_per_core`.
 
 Every RQD host report feeds `LayerLiveMem`, an in-memory ledger of each
 layer's recent per-frame rss peaks (last 32 frames, no SQL). The layer's size
@@ -527,12 +527,12 @@ memory, so the placement score, the fit check, every cap and the booking all
 see the layer's real shape. The metric defaults to self-derivation: each
 tick, each host group's own memory-per-core (total memory over total cores),
 so an 18G layer sizes to 5 cores on a 3.5G-per-core farm and follows the
-hardware when the farm changes. Setting `scheduler.mem_per_core` (KB per
+hardware when the farm changes. Setting `maestro.mem_per_core` (KB per
 core) pins a studio-wide ratio instead. Bounds:
 never below the ask, never past the layer's max cores, non-threadable layers
 never change (a single-threaded renderer cannot use the cores). The resize
-figure rides into `planHost`, so the commit books exactly the shape the
-planner scored: no divergence.
+figure rides into `planHost`, so the commit books exactly the shape
+Maestro scored: no divergence.
 
 The contract for artists and service defaults: setting cores to 1 on a
 threadable layer means "let the system decide". Such a layer, before any rss
@@ -553,22 +553,22 @@ scheduler.
 
 ## 4. Concurrency model
 
-The planner reasons over an in-memory snapshot while commits and external
+Maestro reasons over an in-memory snapshot while commits and external
 events change the database in the background. This is safe by design.
 
 **Single-booker invariant.** Three guards ensure nothing competes to
-*consume* capacity behind the planner's back:
+*consume* capacity behind Maestro's back:
 
 1. `tickInFlight` compare-and-set, one Cuebot never overlaps its own ticks.
 2. Leader advisory lock, only one Cuebot plans across the deployment.
-3. In `facility` mode `scheduler.enabled` suppresses the legacy `BookingQueue`
+3. In `facility` mode `maestro.enabled` suppresses the legacy `BookingQueue`
    enqueue in `HostReportHandler`; in `managed` mode the legacy dispatcher keeps
    running but its query excludes `b_scheduler_managed` shows, so the two never
    book the same show.
 
 So the only things that can change host state during a tick are:
 
-- **The planner's own commits**: already accounted for, because the planner
+- **Maestro's own commits**: already accounted for, because Maestro
   decrements its in-memory snapshot for each decision as it makes it.
 - **External frame completions**: these only *free* cores, i.e. the
   snapshot is conservative (it under-counts free capacity). Safe.
@@ -584,15 +584,15 @@ guards underneath:
   frame grab. A frame that loses the version race is dropped from the batch
   (comparing affected-row counts) and stays WAITING for the next tick.
 
-If the batch books fewer frames than the planner estimated (a host had less
-room than the snapshot, or a frame lost its version race), the planner merely
+If the batch books fewer frames than Maestro estimated (a host had less
+room than the snapshot, or a frame lost its version race), Maestro merely
 over-decremented its in-memory copy and leaves that host slightly
 under-packed for the rest of the tick. The next tick's fresh snapshot
 corrects it. Failures bias toward **under-booking** (waste a little capacity
 for one tick), never over-booking.
 
 **Drift is bounded to a single tick** because the batched commit is
-synchronous on the planner thread: when it returns, the database fully
+synchronous on the planning thread: when it returns, the database fully
 reflects this tick's bookings, so the next snapshot re-grounds on reality.
 Only the RQD launches run afterward, fire-and-forget on the launch pool, so a
 slow or sluggish RQD never stalls the next tick. There is no commit worker
@@ -603,10 +603,10 @@ synchronization point.
 
 ## 5. Performance
 
-The planner is built to take load off the database, the scaling bottleneck of
+Maestro is built to take load off the database, the scaling bottleneck of
 the legacy path, and to fill capacity the instant it exists.
 
-**It fills the farm immediately.** Because the planner places across the whole
+**It fills the farm immediately.** Because Maestro places across the whole
 farm in a single tick, rather than booking one host at a time as each host
 reports, it saturates idle capacity in one pass instead of waiting for a report
 from every host. From a cold start in the DB-backed simulator it drove 1553
@@ -620,7 +620,7 @@ books each frame in its own `@Transactional` call, so booking N frames is N
 transactions, every one taking row locks on the same few hot accounting rows
 (subscription, folder_resource, point, layer_stat, job_stat). Under load those
 transactions serialize on the shared rows and per-transaction BEGIN/COMMIT
-overhead dominates. The planner lands every booking for a tick in a single
+overhead dominates. Maestro lands every booking for a tick in a single
 transaction (`startFramesAndProcsBatch`, section 3.3): a batched frame UPDATE (a
 VALUES join keyed on `(pk_frame, int_version)`), a multi-row proc INSERT, one
 summed `UPDATE host` per host, and the resource-counter deltas accumulated in
@@ -635,7 +635,7 @@ every completion must touch.
 is reactive and per-host: every host report runs `findDispatchJobs(host)`, a
 heavy multi-table join, so the count of heavy candidate queries grows with the
 host count and the report rate, a per-host "query storm" that worsens as the
-farm grows. The planner is proactive and farm-wide: one host-snapshot query per
+farm grows. Maestro is proactive and farm-wide: one host-snapshot query per
 tick, hosts bucketed into a few static spec groups, then one candidate-layer
 query per group. On a homogeneous farm that is O(G) heavy queries per tick
 (G = distinct host specs, a small constant) instead of O(H) per report cycle
@@ -649,8 +649,8 @@ transaction per booking decision plus a heavy join per host report" to
 "in-memory planning with one batched commit per tick." In the DB-backed
 simulator that is about an order of magnitude less database traffic in steady
 state, and more than that on the worst-case per-frame row-fetch: the legacy path
-fetched on the order of ~75,000 rows per completed frame, the planner ~1,000.
-The database is still the remaining ceiling, not the planner, but the planner
+fetched on the order of ~75,000 rows per completed frame, Maestro ~1,000.
+The database is still the remaining ceiling, not Maestro, but Maestro
 already takes most of the load off it.
 
 ---
@@ -659,39 +659,41 @@ already takes most of the load off it.
 
 | Property | Default | Meaning |
 |---|---|---|
-| `scheduler.enabled` | `no` | Rollout switch: `no` (off, legacy owns every show), `facility` (planner owns all shows, legacy BookingQueue globally suppressed), or `managed` (planner owns only shows flagged `b_scheduler_managed=true`, set per show via the show API; legacy keeps the rest). Back-compat: `true`=facility, `false`=no. |
-| `scheduler.read_pool_size` | = launch pool size | Threads for the parallel per-host plan reads (read-only, DB-bound). |
-| `scheduler.launch_pool_size` | `8` | Threads for the fire-and-forget RQD launches after the batched commit. |
-| `scheduler.launch_queue_size` | `16384` | Bound on queued launches; on overflow a launch is dropped and recovered by RQD report reconciliation. |
-| `scheduler.layer_candidates_per_group_max` | `2000` | Cap on candidate layers fetched per group per tick. |
-| `scheduler.reservations_enabled` | `true` | Enable reservations and backfill. When off, pure placement scoring. |
-| `scheduler.reservation_block_seconds` | `300` | Net blocked time a layer must accrue before it may reserve. |
-| `scheduler.reservation_max_fraction` | `0.5` | Max fraction of a layer's fitting hosts that reservations may hold. |
-| `scheduler.reservation_max_grantees` | `8` | Max distinct layers holding reservations farm-wide. |
-| `scheduler.backfill_enabled` | `true` | Allow lower-priority frames to backfill draining reserved hosts. |
-| `scheduler.locality_enabled` | `true` | Prefer hosts already running the layer (co-locality / cache coherence). |
-| `scheduler.locality_bonus` | `8.0` | Score bonus for a co-located host. Applied after fit/reservation filtering, so it never overrides them. |
-| `scheduler.locality_window_frames` | `64` | Cache-warmth window (§3.7): a vacated host keeps a decayed pull on its layer until this many foreign frames have displaced its cache. 0 disables. |
-| `scheduler.stat_interval_seconds` | `300` | Cadence of the consolidated INFO `Scheduler stat:` line (planner health, farm fill, throughput, reservations). Lower it for live debugging. |
-| `scheduler.license.provider` | (unset) | Where live license counts come from: an http endpoint or `script:<cmd>` wrapping a vendor CLI. Unset while layers declare `CUE_LICENSES`: those layers are held and a warning names them. |
-| `scheduler.license.poll_seconds` | `20` | Provider poll cadence (every Cuebot polls). |
-| `scheduler.license.timeout_seconds` | `10` | Hard deadline on one provider call; a hung CLI is killed. |
-| `scheduler.license.stale_seconds` | `300` | Sample age past which the planner fails closed and holds licensed layers. |
-| `scheduler.license.inflight_pad_seconds` | `5` | Padding on the in-flight window, covering providers that timestamp their response after collection. |
-| `scheduler.license.headroom.<name>` | `0` | Seats withheld per license for interactive users (default via `headroom.default`). |
-| `scheduler.license.env_key` | `CUE_LICENSES` | Layer environment key carrying the license names. |
-| `scheduler.license.denied_exit_statuses` | (empty) | Exit codes meaning "could not get a license": such frames requeue WAITING without spending a retry. |
-| `scheduler.host_limit_seat_bonus` | `16.0` | Score bonus per host_based license pool the host already holds a seat in; packs licensed work onto the fewest machines. |
-| `scheduler.layer_host_max_frac` | `0.25` | SOFT per-host layer cap: one layer may hold at most this fraction of a host's cores (as frames, floor 8), so a flood spills across hosts instead of blanketing one. The cap yields when it is the only blocker: a fitting idle host that only the cap refuses is given to the layer (rss-proven layers only), so a lone farm-sized layer fills the farm instead of stranding it. On a busy farm no such host exists and the cap holds. 0 disables. |
-| `scheduler.mem_per_core` | `0` | Memory-per-core ratio (KB) for rss-driven layer sizing (§3.9). 0 (the default) derives it from each group's own hosts; set e.g. 4194304 to pin 4G/core studio-wide. |
+| `maestro.enabled` | `no` | Rollout switch: `no` (off, legacy owns every show), `facility` (Maestro owns all shows, legacy BookingQueue globally suppressed), or `managed` (Maestro owns only shows flagged `b_scheduler_managed=true`, set per show via the show API; legacy keeps the rest). Back-compat: `true`=facility, `false`=no. |
+| `maestro.read_pool_size` | = launch pool size | Threads for the parallel per-host plan reads (read-only, DB-bound). |
+| `maestro.launch_pool_size` | `8` | Threads for the fire-and-forget RQD launches after the batched commit. |
+| `maestro.launch_queue_size` | `16384` | Bound on queued launches; on overflow a launch is dropped and recovered by RQD report reconciliation. |
+| `maestro.layer_candidates_per_group_max` | `2000` | Cap on candidate layers fetched per group per tick. |
+| `maestro.reservations_enabled` | `true` | Enable reservations and backfill. When off, pure placement scoring. |
+| `maestro.reservation_block_seconds` | `300` | Net blocked time a layer must accrue before it may reserve. |
+| `maestro.reservation_max_fraction` | `0.5` | Max fraction of a layer's fitting hosts that reservations may hold. |
+| `maestro.reservation_max_grantees` | `8` | Max distinct layers holding reservations farm-wide. |
+| `maestro.backfill_enabled` | `true` | Allow lower-priority frames to backfill draining reserved hosts. |
+| `maestro.locality_enabled` | `true` | Prefer hosts already running the layer (co-locality / cache coherence). |
+| `maestro.locality_bonus` | `8.0` | Score bonus for a co-located host. Applied after fit/reservation filtering, so it never overrides them. |
+| `maestro.locality_window_frames` | `64` | Cache-warmth window (§3.7): a vacated host keeps a decayed pull on its layer until this many foreign frames have displaced its cache. 0 disables. |
+| `maestro.stat_interval_seconds` | `300` | Cadence of the consolidated INFO `Maestro stat:` line (Maestro health, farm fill, throughput, reservations). Lower it for live debugging. |
+| `maestro.license.provider` | (unset) | Where live license counts come from: an http endpoint or `script:<cmd>` wrapping a vendor CLI. Unset while layers declare `CUE_LICENSES`: those layers are held and a warning names them. |
+| `maestro.license.poll_seconds` | `20` | Provider poll cadence (every Cuebot polls). |
+| `maestro.license.timeout_seconds` | `10` | Hard deadline on one provider call; a hung CLI is killed. |
+| `maestro.license.stale_seconds` | `300` | Sample age past which Maestro fails closed and holds licensed layers. |
+| `maestro.license.inflight_pad_seconds` | `5` | Padding on the in-flight window, covering providers that timestamp their response after collection. |
+| `maestro.license.headroom.<name>` | `0` | Seats withheld per license for interactive users (default via `headroom.default`). |
+| `maestro.license.env_key` | `CUE_LICENSES` | Layer environment key carrying the license names. |
+| `maestro.license.denied_exit_statuses` | (empty) | Exit codes meaning "could not get a license": such frames requeue WAITING without spending a retry. |
+| `maestro.host_limit_seat_bonus` | `16.0` | Score bonus per host_based license pool the host already holds a seat in; packs licensed work onto the fewest machines. |
+| `maestro.layer_host_max_frac` | `0.25` | SOFT per-host layer cap: one layer may hold at most this fraction of a host's cores (as frames, floor 8), so a flood spills across hosts instead of blanketing one. The cap yields when it is the only blocker: a fitting idle host that only the cap refuses is given to the layer (rss-proven layers only), so a lone farm-sized layer fills the farm instead of stranding it. On a busy farm no such host exists and the cap holds. 0 disables. |
+| `maestro.mem_per_core` | `0` | Memory-per-core ratio (KB) for rss-driven layer sizing (§3.9). 0 (the default) derives it from each group's own hosts; set e.g. 4194304 to pin 4G/core studio-wide. |
+| `maestro.plan_zero_warn_ticks` | `40` | Consecutive ticks a layer may plan but commit zero frames before a WARN names it (a commit-time gate Maestro does not model is rejecting it). |
 | `dispatcher.job_frame_dispatch_max` | `8` | Max frames of one job booked onto a host per tick. |
 | `dispatcher.host_frame_dispatch_max` | `12` | Max frames booked onto a host per tick. |
+| `dispatcher.scheduler_manages_resources` | `false` | Set true only when an EXTERNAL scheduler owns the accounting tables via its own recompute: Cuebot then skips increments and decrements for `b_scheduler_managed` shows. Maestro's own `managed` mode leaves this false — its bookings and releases both go through Cuebot. |
 
 The reservation **width gate** (`RESERVATION_MIN_HOST_FRACTION`, 0.5 of the
 largest host in a group) is deliberately a fixed constant, not a property:
 loosening it reintroduces the small-frame flooding it exists to prevent.
 
-**Rollback** is a single flag: set `scheduler.enabled=no` and the legacy
+**Rollback** is a single flag: set `maestro.enabled=no` and the legacy
 dispatcher resumes. Progressive rollout works the same way in reverse: in
 `managed` mode, clearing a show's `b_scheduler_managed` flag hands it straight
 back to the legacy dispatcher with no restart.
@@ -717,31 +719,31 @@ back to the legacy dispatcher with no restart.
   left intact.
 - **Spec-group explosion**: if the host-spec group count approaches the host
   count (commonly a host name leaking into the tag set), planning degrades to
-  one candidate query per host, the very storm grouping avoids. The scheduler
+  one candidate query per host, the very storm grouping avoids. Maestro
   logs a throttled WARNING (at most once every few minutes) so it is caught
   without flooding the log.
 - **Bare-hostname tag pins are not honored**: cuebot auto-adds each host's own
   name as a tag, and `normalizeTags` strips it from the group key (that is what
   prevents the group explosion above). As a result a layer tagged with *only* a
   bare hostname (`layer.tags == "<hostname>"`, the legacy exclusive-pin idiom)
-  matches no group and never dispatches under the scheduler — its frames sit
+  matches no group and never dispatches under Maestro — its frames sit
   `WAITING`. The legacy dispatcher honors such pins (it matches the host's raw
-  tags), so this is a silent difference for `scheduler.enabled` shows. A layer
+  tags), so this is a silent difference for `maestro.enabled` shows. A layer
   that carries a shared tag alongside the hostname still dispatches on the shared
   tag. If exclusive hostname pinning is needed, keep those shows on the legacy
   dispatcher (or route via a dedicated allocation/tag instead of a host name).
 
 **Observability.** Per-tick detail is DEBUG; INFO carries one consolidated
-`Scheduler stat:` line per `scheduler.stat_interval_seconds` (default 5 minutes):
+`Maestro stat:` line per `maestro.stat_interval_seconds` (default 5 minutes):
 
 ```
-Scheduler stat: win=300s ticks=920 skipped=0 lockLost=12 avgTick=556ms maxTick=1840ms
+Maestro stat: win=300s ticks=920 skipped=0 lockLost=12 avgTick=556ms maxTick=1840ms
   | farm hosts=1553 idleHosts=9 cores=57088 idleCores=74 util=99.9% groups=5
   | flow committed=98210 planned=104900 raceLost=6690 launchDropped=0 drained=98180
   | resv held=52 reservedCores=418 granted=31 reqs=11 backfilled=88 backfilledCores=176
 ```
 
-It groups planner health and HA leadership (ticks won, `skipped` = fired while
+It groups Maestro health and HA leadership (ticks won, `skipped` = fired while
 the previous tick still ran, `lockLost` = another Cuebot held the lock, avg/max
 tick), farm fill (hosts, idle hosts, cores, idle cores, utilization, host-spec
 group count), throughput and loss (committed procs, frames planned, `raceLost` =
@@ -756,18 +758,18 @@ line is meant to be pasted straight into a bug report.
 
 ---
 
-## 8. Simulator (scheduler-sim)
+## 8. Simulator (maestro-sim)
 
-The scheduler ships with a full DB-backed simulator under `scheduler-sim/`. It
+Maestro ships with a full DB-backed simulator under `sandbox/maestro-sim/`. It
 is not a model of Cuebot, it *is* Cuebot: a real Cuebot process and a real
 Postgres, driven over gRPC by a fake render farm, so every booking goes through
-the exact production path (the real Scheduler, the real SQL, the real
+the exact production path (the real Maestro scheduler, the real SQL, the real
 frame-complete handler). That makes it the integration test unit tests cannot
 be, and the place to measure behaviour that only shows up under load.
 
 One command brings the whole stack up from nothing:
 
-    scheduler-sim/simulate.py --mode new --feed 240 --metrics 220
+    sandbox/maestro-sim/simulate.py --mode new --feed 240 --metrics 220
 
 It initdb's a Postgres cluster, applies the cuebot schema (Flyway migrations,
 tracked so a cluster that survives across runs still picks up new ones), seeds
@@ -790,7 +792,7 @@ What it reproduces faithfully:
 
 What it can simulate (the knobs):
 
-  - `--mode new|old`: A/B the new scheduler against the legacy dispatcher on an
+  - `--mode new|old`: A/B Maestro against the legacy dispatcher on an
     identical workload.
   - `--feed` / `--jobs`: a sustained saturated backlog or a fixed job set, for
     steady-state utilization and drain time.
@@ -824,12 +826,12 @@ states, per-priority big-job stranding, and a DB-load view (transactions and
 rows fetched per completed frame, busiest tables). That is how the numbers in
 section 5 was produced.
 
-See `cuebot/scheduler-sim/README.md`
+See `sandbox/maestro-sim/README.md`
 for what the simulator does, the `--verify` self-test, and the full flag reference.
 
 ## 9. Testing
 
-An offline simulator that A/B tests the legacy dispatcher and this planner
+An offline simulator that A/B tests the legacy dispatcher and Maestro
 against a production-shaped workload lives on the `sim` branch under
 `benchmarks/sim_cpp/`. It models the workload service
 mix, the operator core/tag pre-pass, KSM co-location, and simulated DB time.

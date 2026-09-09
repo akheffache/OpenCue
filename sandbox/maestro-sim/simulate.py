@@ -10,7 +10,7 @@ starts a workload. Long-running processes (cuebot, fake_rqd, pinger) are left
 running so you can observe them; re-running simulate.py cleans them up again.
 
 It does NOT modify cuebot. Scheduler behaviour is selected only via the
-documented properties (scheduler.enabled / scheduler.reservations_enabled).
+documented properties (maestro.enabled / maestro.reservations_enabled).
 
 Examples:
   # fresh NEW scheduler, hold a 40k-frame backlog for 240s, print metrics
@@ -61,11 +61,14 @@ RUN_USER = _default_run_user()
 # Every path below has a sensible default and an env override, so the sim runs
 # from a plain checkout with no edits. Defaults are derived from this script's
 # own location: FARM is the dir holding the helper scripts (this file's dir),
-# CUEBOT_DIR is its parent (scheduler-sim lives inside cuebot/). Override any of
-# them with the SIM_* env vars when your layout differs (e.g. a detached copy).
+# CUEBOT_DIR is <repo>/cuebot (maestro-sim lives in sandbox/, a sibling of
+# cuebot/). Override any of them with the SIM_* env vars when your layout
+# differs (e.g. a detached copy).
 SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 FARM = os.environ.get("SIM_FARM", SIM_DIR)
-CUEBOT_DIR = os.environ.get("SIM_CUEBOT_DIR", os.path.dirname(SIM_DIR))
+CUEBOT_DIR = os.environ.get(
+    "SIM_CUEBOT_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(SIM_DIR)), "cuebot"))
 # Python that runs the helper scripts. Default: the same interpreter running
 # simulate.py — so `path/to/venv/bin/python simulate.py` just works. Override
 # with SIM_VENV_PY to point at a different venv.
@@ -92,7 +95,7 @@ FEED_LOG = f"{FARM}/feed.log"
 
 # --- Rust scheduler (--mode rust) ----------------------------------------
 # The standalone cue-scheduler binary (rust/crates/scheduler) can drive the sim
-# instead of cuebot's planner. It books straight into Postgres and uses Redis for
+# instead of cuebot's Maestro. It books straight into Postgres and uses Redis for
 # accounting. By default it runs dry-run (no RQD launch; rqd_complete.py drives
 # completion) -- the practical mode. --rust-real-launch flips it to launch on
 # fake_rqd like --mode new (see start_rust_scheduler / ensure_resolver_shim), but
@@ -159,7 +162,7 @@ def ensure_buildable():
     cause is running a detached copy of the scripts outside the repo)."""
     if not os.path.exists(os.path.join(CUEBOT_DIR, "gradlew")):
         log(f"ERROR: no gradlew in CUEBOT_DIR={CUEBOT_DIR}. The sim must reach "
-            f"cuebot's gradlew. Run from cuebot/scheduler-sim/, or set "
+            f"cuebot's gradlew. Run from sandbox/maestro-sim/, or set "
             f"SIM_CUEBOT_DIR to the cuebot dir that contains gradlew.")
         sys.exit(1)
 
@@ -195,7 +198,7 @@ def ensure_grpc_interpreter():
         return
     if os.environ.get("SIM_GRPC_REEXECED") == "1":
         sys.exit("ERROR: venv interpreter still cannot import grpc after "
-                 "setup.sh; check scheduler-sim/setup.sh output.")
+                 "setup.sh; check maestro-sim/setup.sh output.")
     venv_py = os.environ.get("SIM_VENV_PY") or os.path.join(SIM_DIR, "venv", "bin", "python")
     if not (os.path.exists(venv_py) and _interp_has_grpc(venv_py)):
         setup = os.path.join(SIM_DIR, "setup.sh")
@@ -204,11 +207,11 @@ def ensure_grpc_interpreter():
         r = subprocess.run(["bash", setup])
         if r.returncode != 0:
             sys.exit(f"ERROR: setup.sh failed (rc={r.returncode}); cannot build "
-                     f"a venv with grpcio. Run scheduler-sim/setup.sh by hand.")
+                     f"a venv with grpcio. Run maestro-sim/setup.sh by hand.")
         venv_py = os.path.join(SIM_DIR, "venv", "bin", "python")
     if not (os.path.exists(venv_py) and _interp_has_grpc(venv_py)):
         sys.exit(f"ERROR: no usable venv with grpcio at {venv_py}. "
-                 f"Run scheduler-sim/setup.sh by hand.")
+                 f"Run maestro-sim/setup.sh by hand.")
     log(f"re-exec under sim venv interpreter {venv_py}")
     os.environ["SIM_GRPC_REEXECED"] = "1"
     os.execv(venv_py, [venv_py, os.path.abspath(__file__)] + sys.argv[1:])
@@ -247,7 +250,7 @@ def set_fd_limit():
     (grpc.rqd_cache_size=2000), and at full-farm scale it keeps a socket open to
     ~every host at once. Under the default 1024 soft limit it dials the farm fine
     for a few minutes, then hits EMFILE ("Too many open files"): every LaunchFrame
-    throws, the planner books then unbooks each frame, and the farm freezes at
+    throws, Maestro books then unbooks each frame, and the farm freezes at
     high utilization with ZERO throughput (util looks great, nothing completes).
     A 1553-host farm needs >1553 fds, so the default is far too low.
 
@@ -727,19 +730,19 @@ def license_env(script=False):
         # way to learn what is free, so it must HOLD that work rather than book it
         # blind. Used to prove the fail-closed path, since there is deliberately no
         # enable flag to test instead.
-        "SCHEDULER_LICENSE_PROVIDER": os.environ.get(
+        "MAESTRO_LICENSE_PROVIDER": os.environ.get(
             "SIM_LIC_PROVIDER",
             f"script:curl -sf --noproxy '*' {url}" if script else url),
-        "SCHEDULER_LICENSE_POLL_SECONDS": os.environ.get("SIM_LIC_POLL_S", "4"),
-        "SCHEDULER_LICENSE_STALE_SECONDS": os.environ.get("SIM_LIC_STALE_S", "60"),
+        "MAESTRO_LICENSE_POLL_SECONDS": os.environ.get("SIM_LIC_POLL_S", "4"),
+        "MAESTRO_LICENSE_STALE_SECONDS": os.environ.get("SIM_LIC_STALE_S", "60"),
         # Seats held back for interactive users. katana carries the headroom so the
         # scenario can prove an artist still gets a seat while the farm is
         # saturated; the other pools run with none.
-        "SCHEDULER_LICENSE_HEADROOM_KATANA": os.environ.get("SIM_LIC_HEADROOM_KATANA", "8"),
+        "MAESTRO_LICENSE_HEADROOM_KATANA": os.environ.get("SIM_LIC_HEADROOM_KATANA", "8"),
         # Exit status fake_rqd uses for an injected license denial. Such a frame
         # must go back to WAITING without spending a retry, so a busy pool never
         # marches a layer to DEAD.
-        "SCHEDULER_LICENSE_DENIED_EXIT_STATUSES":
+        "MAESTRO_LICENSE_DENIED_EXIT_STATUSES":
             os.environ.get("SIM_LIC_DENY_STATUS", "203"),
     }
 
@@ -747,13 +750,13 @@ def license_env(script=False):
 def start_cuebot(mode, reservations=False, block_seconds=60, max_fraction=0.5,
                  max_grantees=8, backfill=True, booking_off=False,
                  frame_cores_max=0):
-    # scheduler.enabled is a tri-state rollout switch: no | facility | managed
+    # maestro.enabled is a tri-state rollout switch: no | facility | managed
     # (back-compat true=facility/false=no). Default new->facility, else->no;
-    # override with SIM_SCHEDULER_ENABLED (e.g. "managed" for per-show testing).
-    enabled = os.environ.get("SIM_SCHEDULER_ENABLED") or ("facility" if mode == "new" else "no")
+    # override with SIM_MAESTRO_ENABLED (e.g. "managed" for per-show testing).
+    enabled = os.environ.get("SIM_MAESTRO_ENABLED") or ("facility" if mode == "new" else "no")
     resv = "true" if reservations else "false"
     bf = "true" if backfill else "false"
-    log(f"starting cuebot (mode={mode}, scheduler.enabled={enabled}, "
+    log(f"starting cuebot (mode={mode}, maestro.enabled={enabled}, "
         f"reservations={resv}, block={block_seconds}s, "
         f"max_frac={max_fraction}, max_grantees={max_grantees}, backfill={bf}, "
         f"booking_off={booking_off}) ...")
@@ -767,7 +770,7 @@ def start_cuebot(mode, reservations=False, block_seconds=60, max_fraction=0.5,
     # HTTP proxy in JAVA_TOOL_OPTIONS (-Dhttps.proxyHost=..., as sandboxes do),
     # gRPC routes those launches THROUGH the proxy (the farm names are not in
     # nonProxyHosts), which mangles the HTTP/2 stream ("INTERNAL: http2
-    # exception"), so every LaunchFrame fails and the planner books then unbooks
+    # exception"), so every LaunchFrame fails and Maestro books then unbooks
     # and nothing runs (NEW looks busy but completes 0 frames). cuebot needs no
     # proxy at runtime, so bypass it for every host. This -D is appended LAST so
     # it overrides any nonProxyHosts inherited from JAVA_TOOL_OPTIONS.
@@ -780,23 +783,23 @@ def start_cuebot(mode, reservations=False, block_seconds=60, max_fraction=0.5,
         "JAVA_TOOL_OPTIONS": java_tool_opts,
         "CUEBOT_DB_URL": f"jdbc:postgresql://127.0.0.1:{PG_PORT}/cuebot",
         "CUEBOT_DB_USER": "cue", "CUEBOT_DB_PASSWORD": "",
-        "SCHEDULER_ENABLED": enabled,
-        "SCHEDULER_INTERVAL_MS": os.environ.get("SIM_TICK_MS", "3000"),
-        "SCHEDULER_RESERVATIONS_ENABLED": resv,
-        "SCHEDULER_RESERVATION_BLOCK_SECONDS": str(block_seconds),
-        "SCHEDULER_RESERVATION_MAX_FRACTION": str(max_fraction),
-        "SCHEDULER_RESERVATION_MAX_GRANTEES": str(max_grantees),
-        "SCHEDULER_BACKFILL_ENABLED": bf,
+        "MAESTRO_ENABLED": enabled,
+        "MAESTRO_INTERVAL_MS": os.environ.get("SIM_TICK_MS", "3000"),
+        "MAESTRO_RESERVATIONS_ENABLED": resv,
+        "MAESTRO_RESERVATION_BLOCK_SECONDS": str(block_seconds),
+        "MAESTRO_RESERVATION_MAX_FRACTION": str(max_fraction),
+        "MAESTRO_RESERVATION_MAX_GRANTEES": str(max_grantees),
+        "MAESTRO_BACKFILL_ENABLED": bf,
         # Locality bonus toggle, so the LOCALITY scenario can be calibrated
         # against a bonus-off control run (SIM_LOCALITY_ENABLED=false).
-        "SCHEDULER_LOCALITY_ENABLED": os.environ.get("SIM_LOCALITY_ENABLED", "true"),
+        "MAESTRO_LOCALITY_ENABLED": os.environ.get("SIM_LOCALITY_ENABLED", "true"),
         # Per-host layer cap fraction (0 = off). LAYERCAP turns it on.
-        "SCHEDULER_LAYER_HOST_MAX_FRAC": os.environ.get("SIM_LAYER_HOST_MAX_FRAC", "0.25"),
-        # Periodic "Scheduler stat:" summary (carries backfilled=N) fires every
+        "MAESTRO_LAYER_HOST_MAX_FRAC": os.environ.get("SIM_LAYER_HOST_MAX_FRAC", "0.25"),
+        # Periodic "Maestro stat:" summary (carries backfilled=N) fires every
         # this many seconds -- lowered from the 300s default so the live tail's
         # bf[] backfill counter updates often (override with SIM_STAT_INTERVAL_SECONDS).
-        "SCHEDULER_STAT_INTERVAL_SECONDS": os.environ.get("SIM_STAT_INTERVAL_SECONDS", "30"),
-        # --mode rust: scheduler.enabled=false AND booking off, so cuebot only
+        "MAESTRO_STAT_INTERVAL_SECONDS": os.environ.get("SIM_STAT_INTERVAL_SECONDS", "30"),
+        # --mode rust: maestro.enabled=false AND booking off, so cuebot only
         # handles RQD reports/completions (frame + layer/job stat bookkeeping)
         # and never dispatches -- the Rust scheduler owns all booking.
         "DISPATCHER_TURN_OFF_BOOKING": "true" if booking_off else "false",
@@ -837,9 +840,9 @@ def start_extra_cuebot(instance, mode, reservations=False, block_seconds=60,
                        max_fraction=0.5, max_grantees=8, backfill=True,
                        frame_cores_max=0):
     """Launch an ADDITIONAL cuebot (instance >= 1) from the built jar, on offset
-    ports, against the SAME Postgres with scheduler.enabled. All instances race
+    ports, against the SAME Postgres with maestro.enabled. All instances race
     for the Postgres advisory lock each tick, so exactly one plans at a time:
-    this is how the sim exercises leader election / HA (planner.md section 4).
+    this is how the sim exercises leader election / HA (Maestro.md section 4).
 
     Only instance 0 (start_cuebot, via bootRun) is reached by the farm, fake RQD
     and feeder; the extras just join to plan from the shared DB and fire their
@@ -849,7 +852,7 @@ def start_extra_cuebot(instance, mode, reservations=False, block_seconds=60,
     # RQD dial port: there is exactly ONE fake_rqd (started by instance 0 on
     # GRPC_PORT+1 = 8444), so EVERY cuebot must dial RQD there. The old cue+1
     # (8454, 8464, ...) pointed each extra at a dead port, so when an extra won
-    # the planner lock all its launches failed and its frames were booked then
+    # Maestro lock all its launches failed and its frames were booked then
     # unbooked, so the farm looked busy but completed nothing.
     rqd = GRPC_PORT + 1                 # 8444, the single fake_rqd for all instances
     web = 8080 + instance               # embedded Tomcat (metrics); 8081, 8082, ...
@@ -857,14 +860,14 @@ def start_extra_cuebot(instance, mode, reservations=False, block_seconds=60,
     jar = os.path.join(CUEBOT_DIR, "build", "libs", "cuebot.jar")
     if not os.path.exists(jar):
         sys.exit(f"cuebot jar not found at {jar} (ensure_cuebot_built should have built it)")
-    enabled = os.environ.get("SIM_SCHEDULER_ENABLED") or ("facility" if mode == "new" else "no")
+    enabled = os.environ.get("SIM_MAESTRO_ENABLED") or ("facility" if mode == "new" else "no")
     # cuebot in the sim only talks to LOCAL services: postgres on 127.0.0.1, and
     # fake_rqd (the hosts file above maps every farm hostname to 127.0.0.1). But
     # it dials RQD BY HOSTNAME (e.g. jaime0001), and if the environment set a JVM
     # HTTP proxy in JAVA_TOOL_OPTIONS (-Dhttps.proxyHost=..., as sandboxes do),
     # gRPC routes those launches THROUGH the proxy (the farm names are not in
     # nonProxyHosts), which mangles the HTTP/2 stream ("INTERNAL: http2
-    # exception"), so every LaunchFrame fails and the planner books then unbooks
+    # exception"), so every LaunchFrame fails and Maestro books then unbooks
     # and nothing runs (NEW looks busy but completes 0 frames). cuebot needs no
     # proxy at runtime, so bypass it for every host. This -D is appended LAST so
     # it overrides any nonProxyHosts inherited from JAVA_TOOL_OPTIONS.
@@ -877,15 +880,15 @@ def start_extra_cuebot(instance, mode, reservations=False, block_seconds=60,
         "JAVA_TOOL_OPTIONS": java_tool_opts,
         "CUEBOT_DB_URL": f"jdbc:postgresql://127.0.0.1:{PG_PORT}/cuebot",
         "CUEBOT_DB_USER": "cue", "CUEBOT_DB_PASSWORD": "",
-        "SCHEDULER_ENABLED": enabled,
-        "SCHEDULER_INTERVAL_MS": os.environ.get("SIM_TICK_MS", "3000"),
-        "SCHEDULER_RESERVATIONS_ENABLED": "true" if reservations else "false",
-        "SCHEDULER_RESERVATION_BLOCK_SECONDS": str(block_seconds),
-        "SCHEDULER_RESERVATION_MAX_FRACTION": str(max_fraction),
-        "SCHEDULER_RESERVATION_MAX_GRANTEES": str(max_grantees),
-        "SCHEDULER_BACKFILL_ENABLED": "true" if backfill else "false",
-        "SCHEDULER_LAYER_HOST_MAX_FRAC": os.environ.get("SIM_LAYER_HOST_MAX_FRAC", "0.25"),
-        "SCHEDULER_STAT_INTERVAL_SECONDS": os.environ.get("SIM_STAT_INTERVAL_SECONDS", "30"),
+        "MAESTRO_ENABLED": enabled,
+        "MAESTRO_INTERVAL_MS": os.environ.get("SIM_TICK_MS", "3000"),
+        "MAESTRO_RESERVATIONS_ENABLED": "true" if reservations else "false",
+        "MAESTRO_RESERVATION_BLOCK_SECONDS": str(block_seconds),
+        "MAESTRO_RESERVATION_MAX_FRACTION": str(max_fraction),
+        "MAESTRO_RESERVATION_MAX_GRANTEES": str(max_grantees),
+        "MAESTRO_BACKFILL_ENABLED": "true" if backfill else "false",
+        "MAESTRO_LAYER_HOST_MAX_FRAC": os.environ.get("SIM_LAYER_HOST_MAX_FRAC", "0.25"),
+        "MAESTRO_STAT_INTERVAL_SECONDS": os.environ.get("SIM_STAT_INTERVAL_SECONDS", "30"),
         # Offset every listener so the extra never collides with instance 0.
         "CUEBOT_GRPC_CUE_PORT": str(cue),
         "CUEBOT_GRPC_RQD_SERVER_PORT": str(rqd),
@@ -898,7 +901,7 @@ def start_extra_cuebot(instance, mode, reservations=False, block_seconds=60,
         env["DISPATCHER_FRAME_CORES_MAX"] = str(frame_cores_max)
     java = os.path.join(JDK17, "bin", "java") if (JDK17 and os.path.isdir(JDK17)) else "java"
     log(f"starting cuebot #{instance} (jar, gRPC :{cue}, web :{web}, "
-        f"scheduler.enabled={enabled}) ...")
+        f"maestro.enabled={enabled}) ...")
     logf = open(logpath, "w")
     p = subprocess.Popen([java, "-jar", jar], cwd=CUEBOT_DIR, stdout=logf,
                          stderr=subprocess.STDOUT, start_new_session=True, env=env)
@@ -954,12 +957,12 @@ def spawn(script_args, logpath, env_extra=None):
 # Every watched run records utilization (util_sampler) and DB load (db_sampler)
 # to an auto-named scratch dir and renders two PNGs at the end, so a run always
 # leaves graphs behind without any manual sampling step. Override the directory
-# with SIM_GRAPH_DIR; the default is /tmp/scheduler-sim/<mode>-<timestamp>.
+# with SIM_GRAPH_DIR; the default is /tmp/maestro-sim/<mode>-<timestamp>.
 def graph_dir_for(mode):
     base = os.environ.get("SIM_GRAPH_DIR")
     if base:
         return base
-    return os.path.join("/tmp", "scheduler-sim",
+    return os.path.join("/tmp", "maestro-sim",
                         f"{mode}-{time.strftime('%Y%m%d-%H%M%S')}")
 
 
@@ -1169,7 +1172,7 @@ def start_layercap_solo_injector(duration):
 
 
 def start_license_server(duration):
-    """Bring up the fake license server BEFORE cuebot polls it, so the planner's
+    """Bring up the fake license server BEFORE cuebot polls it, so Maestro's
     first sample is real rather than a failed fetch."""
     log(f"starting fake license server on 127.0.0.1:{os.environ.get('SIM_LIC_PORT','9101')} "
         f"(hengine seats / katana / maya, re-reads the farm every "
@@ -1233,7 +1236,7 @@ def set_scheduler_managed(managed):
 
 def write_scheduler_yaml(tick_ms, facility, dry_run=True):
     """Write the cue-scheduler config: point it at the sim's Postgres and Redis,
-    E-PVM placement (the same family the --mode new planner uses). dry_run=True
+    E-PVM placement (the same family the --mode new Maestro uses). dry_run=True
     (default) books in the DB without a real RQD launch (rqd_complete.py drives
     completion) -- the practical mode. dry_run=False (--rust-real-launch) makes the
     scheduler call LaunchFrame on fake_rqd, the same path --mode new uses, for an
@@ -1391,7 +1394,7 @@ def _verify_check(name, gdir, logp, cblog):
         cb = ""
 
     def wl_peaks():
-        """Peak waitlist tallies across every 'Scheduler stat:' line in the cuebot
+        """Peak waitlist tallies across every 'Maestro stat:' line in the cuebot
         log (waitlist section keys: total/flowing/nofit/limit/license/held). The
         scenarios below assert their own cause fired (>0); a farm that never even
         classified its backlog cannot pass."""
@@ -1684,7 +1687,7 @@ def _verify_check(name, gdir, logp, cblog):
         # the scenario teardown; parse both back.
         def read_sets(mode):
             try:
-                txt = open(f"/tmp/scheduler-sim/parity_booked_{mode}.txt").read()
+                txt = open(f"/tmp/maestro-sim/parity_booked_{mode}.txt").read()
             except Exception:
                 return None, None
             b = re.search(r"(?m)^booked=(.*)$", txt)
@@ -1768,8 +1771,8 @@ def _verify_check(name, gdir, logp, cblog):
                        f"{om.group(1) if om else '?'} pool oversubscription")
         return ok, detail
     if name == "TAGMAX":
-        # The planner's cross-group layer dedup: with many tags + a run-anywhere
-        # slice, an undeduped planner re-plans each 'general' layer once per
+        # Maestro's cross-group layer dedup: with many tags + a run-anywhere
+        # slice, an undeduped Maestro re-plans each 'general' layer once per
         # host-spec group and loses all but one copy to the version race. Gate on
         # tagmax_watch.py's verdict: raceLost a small fraction of planned.
         try:
@@ -1857,7 +1860,7 @@ def run_verify():
         ("LIMIT", ["--hosts", "3,4,10", "--limit-test", str(D)]),
         # CAPDROP: a user lowers a running job's max cores below its live usage,
         # then an admin shrinks the show's subscription burst the same way. The
-        # legacy verify triggers reject the planner's batched plus-flush over
+        # legacy verify triggers reject Maestro's batched plus-flush over
         # either cap; a correct scheduler must keep each accounting mirror equal
         # to the procs anyway (no wedge, no negative drift).
         ("CAPDROP", ["--hosts", "3,4,10", "--capdrop-test", str(D)]),
@@ -1927,9 +1930,9 @@ def run_verify():
          {"SIM_LIC_NO_HOSTS": "1"}),
         # POISON: the orphaned-proc drill. Plant terminal stale procs (the state
         # a crash or failed completion leaves behind) on frames at the head of
-        # the dispatch order; the planner must evict them, keep booking, and
+        # the dispatch order; Maestro must evict them, keep booking, and
         # never fail a tick. Before the completion drain + eviction + janitor
-        # this wedged the planner permanently (13 consecutive failed ticks).
+        # this wedged Maestro permanently (13 consecutive failed ticks).
         ("POISON", ["--hosts", "3,4,10", "--feed", str(D + 40),
                     "--poison-test", str(D)]),
         # DEADLOCK: the memory balancer vs the completion drain. fake_rqd
@@ -1998,7 +2001,7 @@ def run_verify():
         # accounting while every pool still runs work.
         ("TAGS_GPU", ["--tags", "8", "--gpu", "0.25", "--feed", str(D + 30),
                       "--tag-gpu-test", str(D)]),
-        # TAGMAX: the planner's cross-group dedup under maximal fragmentation. 120
+        # TAGMAX: Maestro's cross-group dedup under maximal fragmentation. 120
         # random capability tags shatter the FULL farm into host-spec groups AND
         # 30% of layers are run-anywhere ('general', a candidate in EVERY group at
         # once). Without the dedup each such layer is planned once per group per
@@ -2018,7 +2021,7 @@ def run_verify():
         if only and name.upper() not in only:
             continue
         env_extra = entry[2] if len(entry) > 2 else {}
-        gdir = os.path.join("/tmp/scheduler-sim/verify", name.lower())
+        gdir = os.path.join("/tmp/maestro-sim/verify", name.lower())
         logp = gdir + ".log"
         os.makedirs(gdir, exist_ok=True)
         log(f"[verify] === {name}: fresh sim (teardown + reinit) for {D}s ===")
@@ -2068,7 +2071,7 @@ def main():
     ensure_proto_stubs()
     ap = argparse.ArgumentParser(description="One-command fresh scheduler sim")
     ap.add_argument("--mode", choices=["new", "old", "rust"], default="new",
-                    help="new=cuebot's E-PVM planner; old=legacy cuebot booking; "
+                    help="new=cuebot's E-PVM Maestro; old=legacy cuebot booking; "
                          "rust=the standalone cue-scheduler binary "
                          "(rust/crates/scheduler) plans+books while cuebot runs "
                          "with booking off as the completion engine. rust mode "
@@ -2125,7 +2128,7 @@ def main():
                          "Mode-aware default (override to pin any value): 5.0 for "
                          "NEW, 0.1 for OLD and rust. OLD's report-driven booker only "
                          "books a host WHEN it reports, so it needs the fast "
-                         "heartbeat or the farm never fills. NEW (the planner) is "
+                         "heartbeat or the farm never fills. NEW (Maestro) is "
                          "the opposite: its cuebot books AND processes reports, so a "
                          "0.1s flood from 1553 hosts (~10 reports/host/s, ~100x a "
                          "real farm) overruns the host-report handler (~200ms DB "
@@ -2156,7 +2159,7 @@ def main():
                          "gpu mem). GPU layers place only on GPU hosts (enforced by "
                          "cuebot). Default 0 (no GPU). Typical: 0.1.")
     ap.add_argument("--reservations", action="store_true",
-                    help="enable the planner's host reservations for blocked "
+                    help="enable Maestro's host reservations for blocked "
                          "layers (EASY/Maui-style: time gate + per-class cap). "
                          "Default off. Use with --strand to show big jobs no "
                          "longer starve.")
@@ -2222,7 +2225,7 @@ def main():
     ap.add_argument("--layercap-test", type=int, default=0, metavar="SECS",
                     help="LAYERCAP test: flood one deep 1-core layer and assert "
                          "no host ever holds more than the per-host layer cap "
-                         "(scheduler.layer_host_max_frac of its cores, floor 8 "
+                         "(maestro.layer_host_max_frac of its cores, floor 8 "
                          "frames), so one layer cannot blanket a machine.")
     ap.add_argument("--layercap-solo-test", type=int, default=0,
                     metavar="SECS",
@@ -2255,14 +2258,14 @@ def main():
                          "leaving their proc rows alive -- byte-for-byte the "
                          "state the completion path leaves behind when it fails "
                          "after stopFrame but before releasing the proc. A "
-                         "correct planner must evict the stale procs and keep "
-                         "booking; the unfixed planner wedges permanently "
+                         "correct Maestro must evict the stale procs and keep "
+                         "booking; the unfixed Maestro wedges permanently "
                          "(every batch commit hits c_proc_uk and rolls back). "
                          "Pair with --feed.")
     ap.add_argument("--with-licenses", action="store_true",
                     help="run licensed load ALONGSIDE another scenario: starts the "
                          "fake license server and the CUE_LICENSES injector and "
-                         "turns on scheduler.license.*, but leaves the watcher to "
+                         "turns on maestro.license.*, but leaves the watcher to "
                          "the host scenario. Used by FAILOVER, where the promoted "
                          "standby must pick up licensing correctly (it derives "
                          "in-flight seats from the DB precisely so a new leader "
@@ -2312,7 +2315,7 @@ def main():
                          "host-spec groups PLUS a run-anywhere slice "
                          "(SIM_GENERAL_FRAC, default 0.3) of untagged 'general' "
                          "layers that are a candidate in every group. Asserts the "
-                         "planner's cross-group layer dedup holds: raceLost stays a "
+                         "Maestro's cross-group layer dedup holds: raceLost stays a "
                          "small fraction of planned (SIM_TAGMAX_MAX_RACE, default "
                          "0.10). Pair with --feed; normally driven by --verify.")
     ap.add_argument("--folder-test", type=int, default=0, metavar="SECS",
@@ -2387,7 +2390,7 @@ def main():
     if args.verify:
         sys.exit(run_verify())
 
-    # LICENSE: every cuebot reads this to turn scheduler.license.* on, and the
+    # LICENSE: every cuebot reads this to turn maestro.license.* on, and the
     # server/injector/watcher take the port and env key from the same place.
     # --with-licenses runs the licensed load under ANOTHER scenario (FAILOVER),
     # so it configures cuebot but leaves that scenario's watcher in charge.
@@ -2416,7 +2419,7 @@ def main():
 
     # TAGMAX: a heavy tag count shatters the farm into many host-spec groups, and
     # a run-anywhere slice makes untagged 'general' layers a candidate in every
-    # group at once, the maximal stress on the planner's cross-group dedup.
+    # group at once, the maximal stress on Maestro's cross-group dedup.
     # Default both here so a bare `--tagmax-test SECS` is meaningful; an explicit
     # --tags N or SIM_GENERAL_FRAC still wins.
     if args.tagmax_test:
@@ -2501,13 +2504,13 @@ def main():
     write_sim_hosts_file()
     nhosts = reset_db()
     # Hand the show to whichever scheduler owns it: the standalone Rust scheduler
-    # (rust mode), or the Java planner in per-show 'managed' mode. Otherwise force
+    # (rust mode), or the Java Maestro in per-show 'managed' mode. Otherwise force
     # the flag OFF so a leftover true can't make cuebot's own dispatch skip the
     # show (migration V45 filters b_scheduler_managed=false).
-    set_scheduler_managed(rust or os.environ.get("SIM_SCHEDULER_ENABLED") == "managed")
+    set_scheduler_managed(rust or os.environ.get("SIM_MAESTRO_ENABLED") == "managed")
     ensure_cuebot_built()
     # LICENSE test: the license server must be answering BEFORE cuebot's first
-    # poll, so the planner starts from a real sample instead of a failed fetch
+    # poll, so Maestro starts from a real sample instead of a failed fetch
     # (which would correctly, but uninterestingly, hold every licensed layer).
     lic_secs = args.license_test or (args.failover_test if args.with_licenses else 0)
     if lic_secs:
@@ -2736,7 +2739,7 @@ def main():
         npoison = int(os.environ.get("SIM_POISON_COUNT", "3"))
         # Two modes. "plant" (default) is the deterministic gate: inject the
         # terminal orphan state directly, whatever its cause, and demand the
-        # planner survives it. "stall" reproduces the WHOLE causal chain
+        # Maestro survives it. "stall" reproduces the WHOLE causal chain
         # organically, as proposed by Aghiles: SIGSTOP cuebot mid-load so
         # completion acks time out and fake_rqd re-sends, then SIGCONT -- the
         # resume floods the unguarded inline post-completion path with
@@ -2784,7 +2787,7 @@ def main():
             f"WHERE f.str_state='WAITING' AND f.int_depend_count=0 "
             f"  AND f.ts_started IS NULL "
             # Aim at the HEAD of the queue: lowest dispatch order in layers the
-            # planner is actively refilling (they hold procs right now), which
+            # Maestro is actively refilling (they hold procs right now), which
             # is the plan-read's own pick order. A random waiting frame deep in
             # the backlog might not be planned for minutes; these collide on the
             # next tick -- as in the real incident, where the orphaned frames
@@ -2840,13 +2843,13 @@ def main():
               f"frames started after injection={started_after} (floor {floor})  "
               f"tick failures after injection={tick_fails}", flush=True)
         if orphans_left == 0 and started_after >= floor and tick_fails <= 2:
-            print(f"PASS: the planner evicted all {len(poisoned)} stale procs and "
+            print(f"PASS: Maestro evicted all {len(poisoned)} stale procs and "
                   f"kept booking ({started_after} frames started, {tick_fails} "
                   f"failed ticks) -- one corpse cannot stop the farm.", flush=True)
         elif started_after < floor:
             print(f"FAIL: booking STOPPED after the injection ({started_after} "
                   f"frames < {floor}; {tick_fails} failed ticks; {orphans_left} "
-                  f"orphans still in place) -- the planner is wedged by a stale "
+                  f"orphans still in place) -- Maestro is wedged by a stale "
                   f"proc, the whole-farm outage this scenario exists to prevent.",
                   flush=True)
         else:

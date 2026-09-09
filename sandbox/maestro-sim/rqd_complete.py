@@ -18,7 +18,7 @@ RPCs:
      marks the frame SUCCEEDED, and updates layer_stat/job_stat -- the counters
      the scheduler's next pending-work query reads.
 
-cuebot runs with booking OFF (scheduler.enabled=false + dispatcher.turn_off_booking
+cuebot runs with booking OFF (maestro.enabled=false + dispatcher.turn_off_booking
 =true), so it never dispatches; it is purely the completion/stat engine. This
 reuses production frame/stat bookkeeping without re-implementing it, and needs no
 RQD gRPC path -- so no /etc/hosts and fully non-root, like the rest of the sim.

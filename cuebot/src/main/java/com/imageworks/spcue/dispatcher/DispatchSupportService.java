@@ -480,7 +480,7 @@ public class DispatchSupportService implements DispatchSupport {
 
         // 4. EVICT STALE PROCS on frames we just won: we hold the WAITING ->
         // RUNNING transition, so any proc still sitting there is a corpse, and
-        // ONE corpse would wedge the planner forever (c_proc_uk collision
+        // ONE corpse would wedge Maestro forever (c_proc_uk collision
         // rolls back the whole batch, every tick). Delete it, refund its host.
         List<String> winnerFrameIds = new ArrayList<String>(winnerProcs.size());
         for (FrameBooking b : winners) {
@@ -510,7 +510,7 @@ public class DispatchSupportService implements DispatchSupport {
 
         // 5. Insert the winner procs. Host idle was already decremented in step 1,
         // so this only writes the proc rows. The subscription/layer/job/folder/
-        // point counters are batched by the Scheduler from the winners returned here.
+        // point counters are batched by Maestro from the winners returned here.
         procDao.batchInsertVirtualProcs(winnerProcs);
 
         // FRAME_STARTED events are published by the caller via

@@ -23,7 +23,7 @@ Archetypes (1 job = 1 layer, 1-core frames, tiny):
                   scheduler missing the facility gate books it. Asymmetric in
                   the OPPOSITE direction, which parity also fails.
 
-Writes {booked,notbooked} to /tmp/scheduler-sim/parity_booked_<mode>.txt (the
+Writes {booked,notbooked} to /tmp/maestro-sim/parity_booked_<mode>.txt (the
 dir outlives per-scenario teardown) and prints one PARITY RESULT line; the
 PARITY_OLD/PARITY_NEW verify checks read those.
 
@@ -40,7 +40,7 @@ import farm_spec as spec
 DURATION = int(sys.argv[1]) if len(sys.argv) > 1 else 180
 MODE = sys.argv[2] if len(sys.argv) > 2 else "unknown"
 PSQL = spec.psql_cmd()
-OUT_DIR = "/tmp/scheduler-sim"
+OUT_DIR = "/tmp/maestro-sim"
 OUT = f"{OUT_DIR}/parity_booked_{MODE}.txt"
 
 # One os value the multi-OS hosts advertise (SIM_HOST_OS="rhel7,rhel9").

@@ -14,10 +14,10 @@
 # simulate.py documents (SIM_VENV_PY, SIM_JDK_HOME, ...).
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # cuebot/scheduler-sim
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # sandbox/maestro-sim
 REPO="$(cd "$HERE/../.." && pwd)"                       # OpenCue repo root
 PROTO_SRC="$REPO/proto/src"
-CUEBOT_DIR="$(cd "$HERE/.." && pwd)"                    # cuebot (has gradlew)
+CUEBOT_DIR="$REPO/cuebot"                               # cuebot (has gradlew)
 VENV="${SIM_VENV:-$HERE/venv}"
 
 say() { printf '\033[1m[setup]\033[0m %s\n' "$*"; }

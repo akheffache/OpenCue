@@ -54,7 +54,7 @@ import static org.junit.Assert.assertTrue;
  */
 @Transactional
 @ContextConfiguration(classes = TestAppConfig.class, loader = AnnotationConfigContextLoader.class)
-public class SchedulerCandidateParityTests extends AbstractTransactionalJUnit4SpringContextTests {
+public class MaestroCandidateParityTests extends AbstractTransactionalJUnit4SpringContextTests {
 
     @Resource
     JobLauncher jobLauncher;
@@ -69,21 +69,21 @@ public class SchedulerCandidateParityTests extends AbstractTransactionalJUnit4Sp
     @Resource
     HostDao hostDao;
     @Resource
-    Scheduler scheduler;
+    Maestro maestro;
     @Resource
     ConfigurableEnvironment springEnv;
 
-    // Same fixture/host/values as DispatcherDaoTests; only delta is scheduler.enabled=facility.
+    // Same fixture/host/values as DispatcherDaoTests; only delta is maestro.enabled=facility.
     private static final String HOSTNAME = "beta";
     private static final String JOB = "pipe-dev.cue-testuser_shell_dispatch_test_v1";
 
     // Facility mode ONLY while these tests run, injected into the SHARED
     // context's environment: no second Spring context, no second gRPC server.
-    // Scheduler reads scheduler.enabled per call, so this takes effect live.
+    // Maestro reads maestro.enabled per call, so this takes effect live.
     @Before
     public void facilityMode() {
         springEnv.getPropertySources().addFirst(new MapPropertySource("parityFacility",
-                Collections.singletonMap("scheduler.enabled", "facility")));
+                Collections.singletonMap("maestro.enabled", "facility")));
     }
 
     @After
@@ -117,27 +117,27 @@ public class SchedulerCandidateParityTests extends AbstractTransactionalJUnit4Sp
         return jobManager.findJobDetail(JOB);
     }
 
-    /** The Scheduler candidate list for the group containing HOSTNAME (empty if none). */
-    private List<Scheduler.LayerCandidate> candidates() {
-        Map<Scheduler.HostSpecKey, List<Scheduler.BookableHost>> groups =
-                Scheduler.groupByHostSpec(scheduler.readAllHosts());
-        for (Map.Entry<Scheduler.HostSpecKey, List<Scheduler.BookableHost>> e : groups.entrySet()) {
+    /** Maestro candidate list for the group containing HOSTNAME (empty if none). */
+    private List<Maestro.LayerCandidate> candidates() {
+        Map<Maestro.HostSpecKey, List<Maestro.BookableHost>> groups =
+                Maestro.groupByHostSpec(maestro.readAllHosts());
+        for (Map.Entry<Maestro.HostSpecKey, List<Maestro.BookableHost>> e : groups.entrySet()) {
             int maxCores = 0;
             boolean mine = false;
-            for (Scheduler.BookableHost h : e.getValue()) {
+            for (Maestro.BookableHost h : e.getValue()) {
                 if (h.coresTotal > maxCores)
                     maxCores = h.coresTotal;
                 if (HOSTNAME.equals(h.hostName))
                     mine = true;
             }
             if (mine)
-                return scheduler.readLayerCandidatesForGroup(e.getKey(), maxCores);
+                return maestro.readLayerCandidatesForGroup(e.getKey(), maxCores);
         }
         return Collections.emptyList();
     }
 
     private boolean candidatesContainJob(String jobId) {
-        for (Scheduler.LayerCandidate c : candidates()) {
+        for (Maestro.LayerCandidate c : candidates()) {
             if (jobId.equals(c.jobId))
                 return true;
         }

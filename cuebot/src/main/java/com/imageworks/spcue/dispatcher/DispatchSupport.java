@@ -182,16 +182,6 @@ public interface DispatchSupport {
     public void startFrameAndProc(VirtualProc proc, DispatchFrame frame);
 
     /**
-     * Batch variant of {@link #startFrameAndProc}: commits many planned bookings in one transaction
-     * with batched statements, version-guarded frame RUNNING transition, proc INSERT, and host idle
-     * decrement, instead of one transaction and ~6 round-trips per frame. The
-     * subscription/layer/job/ folder/point counters are NOT written here; the Scheduler batches
-     * those separately. Frames that lost their optimistic version race are dropped.
-     *
-     * @param bookings the planned (frame, proc) pairs from the planning phase
-     * @return the subset of bookings that were actually committed (winners)
-     */
-    /**
      * The janitor sweep: delete every proc whose frame is no longer RUNNING (older than the given
      * age) and refund its host resources. Catches orphans on frames that never get planned again
      * (job finished or killed), which the commit-time eviction cannot reach. Returns how many were
@@ -208,6 +198,16 @@ public interface DispatchSupport {
      */
     boolean[] stopFramesBatch(java.util.List<QueuedFrameCompletion> completions);
 
+    /**
+     * Batch variant of {@link #startFrameAndProc}: commits many planned bookings in one transaction
+     * with batched statements, version-guarded frame RUNNING transition, proc INSERT, and host idle
+     * decrement, instead of one transaction and ~6 round-trips per frame. The
+     * subscription/layer/job/ folder/point counters are NOT written here; Maestro batches those
+     * separately. Frames that lost their optimistic version race are dropped.
+     *
+     * @param bookings the planned (frame, proc) pairs from the planning phase
+     * @return the subset of bookings that were actually committed (winners)
+     */
     public java.util.List<FrameBooking> startFramesAndProcsBatch(
             java.util.List<FrameBooking> bookings);
 

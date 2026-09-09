@@ -358,7 +358,7 @@ public class CoreUnitDispatcher implements Dispatcher {
 
     @Override
     public List<VirtualProc> dispatchHost(DispatchHost host, LayerInterface layer) {
-        // Layer-exact dispatch for the Scheduler: book frames of the specific
+        // Layer-exact dispatch for Maestro: book frames of the specific
         // layer it scored and reserved this host for, not the whole job, by
         // scoping the frame query to the layer.
         return dispatchHostFrames(host, layer, "layer", () -> dispatchSupport
@@ -377,12 +377,12 @@ public class CoreUnitDispatcher implements Dispatcher {
         // deliver exactly that. 0 = no slice info: legacy per-call trickle.
         int bookMax =
                 planLimit > 0 ? planLimit : getIntProperty("dispatcher.job_frame_dispatch_max");
-        // Scheduler-native lean read. The planner already loaded this host and
+        // Maestro-native lean read. Maestro already loaded this host and
         // already enforced show-burst and job caps in-tick, so we skip the
         // per-frame isShowAtOrOverBurst / isJobBookable DB round-trips the
         // legacy dispatchHost makes (~15 per placement). One candidate query,
         // then build procs and apply the in-memory resource fit checks; the
-        // Scheduler commits the bookings in bulk. No writes, no RQD launch.
+        // Maestro commits the bookings in bulk. No writes, no RQD launch.
         List<FrameBooking> bookings = new ArrayList<FrameBooking>();
 
         List<DispatchFrame> frames = dispatchSupport.findNextDispatchFrames(layer, host,
@@ -392,7 +392,7 @@ public class CoreUnitDispatcher implements Dispatcher {
                 env.getProperty("dispatcher.frame.selfish.services", "").split(",");
         for (DispatchFrame frame : frames) {
 
-            // The planner sized this layer from its observed rss (LayerLiveMem):
+            // Maestro sized this layer from its observed rss (LayerLiveMem):
             // book the frames at that size, and reserve the memory the layer
             // really uses, so the plan and the commit describe the same frame.
             // 0 = no resize (no evidence, not threadable, or feature off).
@@ -406,7 +406,7 @@ public class CoreUnitDispatcher implements Dispatcher {
             VirtualProc proc;
             try {
                 // expandThreadable=false: reserve exactly the requested cores. The
-                // planner scored and accounted this placement at the same figure,
+                // Maestro scored and accounted this placement at the same figure,
                 // so the thread-mode grab-idle expansion would over-reserve and
                 // corrupt that accounting.
                 proc = VirtualProc.build(host, frame, false, selfishServices);

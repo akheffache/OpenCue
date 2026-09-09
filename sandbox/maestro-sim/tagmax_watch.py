@@ -1,10 +1,10 @@
-"""TAGMAX verdict: the planner's cross-group layer dedup under heavy fragmentation.
+"""TAGMAX verdict: Maestro's cross-group layer dedup under heavy fragmentation.
 
 Companion to `simulate.py --tagmax-test` (normally driven by --verify). The full
 farm is shattered into many host-spec groups by a large capability-tag count
 (SIM_NTAGS, default 120), while a run-anywhere slice (SIM_GENERAL_FRAC, default
 0.3) of layers carry no tag and so stay on plain 'general', a candidate in EVERY
-group at once. Without the dedup the planner re-plans each such layer once per
+group at once. Without the dedup Maestro re-plans each such layer once per
 group per tick; the parallel per-host commit then pulls the same waiting frames,
 and all but one copy loses the frame.int_version race at commit. With the dedup a
 layer placed in one group this tick is skipped in the rest, so planned frames
@@ -13,7 +13,7 @@ about equal committed frames and the wasted planning disappears.
 The signal is the Scheduler's own per-window stat line in the cuebot log
 (SIM_CUEBOT_LOG):
 
-    Scheduler stat: ... | farm ... groups=G | flow committed=C planned=P raceLost=R ...
+    Maestro stat: ... | farm ... groups=G | flow committed=C planned=P raceLost=R ...
 
 raceLost (= planned - committed) is the frames a plan produced that lost the
 version race. This watcher sums planned and raceLost across the run (past a warmup
@@ -24,7 +24,7 @@ window) and asserts the loss stayed a small fraction of planned:
       this sits near zero; without it the run-anywhere layers push it near 1.
 
   COVERAGE (floors, so the verdict cannot pass vacuously):
-    - summed planned >= SIM_TAGMAX_MIN_PLANNED (default 5000): the planner did
+    - summed planned >= SIM_TAGMAX_MIN_PLANNED (default 5000): Maestro did
       real work, not one idle window;
     - peak host-spec groups >= SIM_TAGMAX_MIN_GROUPS (default 80): the tag
       fragmentation actually materialised (an un-fragmented farm cannot exhibit
@@ -41,11 +41,11 @@ MAX_FRAC = float(os.environ.get("SIM_TAGMAX_MAX_RACE", "0.10"))
 MIN_PLANNED = int(os.environ.get("SIM_TAGMAX_MIN_PLANNED", "5000"))
 MIN_GROUPS = int(os.environ.get("SIM_TAGMAX_MIN_GROUPS", "80"))
 
-# Each "Scheduler stat" line carries one window's planned/raceLost plus the last
+# Each "Maestro stat" line carries one window's planned/raceLost plus the last
 # planned tick's host-spec group count. groups=G precedes the flow section on the
 # same line (see Scheduler.maybeLogStat).
 STAT_RE = re.compile(
-    r"Scheduler stat:.*?groups=(\d+).*?"
+    r"Maestro stat:.*?groups=(\d+).*?"
     r"flow committed=(\d+) planned=(\d+) raceLost=(\d+)")
 
 
@@ -70,7 +70,7 @@ def parse_log():
 
 
 def main():
-    print(f"watching TAGMAX for {DURATION}s: planner cross-group dedup must hold, "
+    print(f"watching TAGMAX for {DURATION}s: Maestro cross-group dedup must hold, "
           f"raceLost/planned <= {MAX_FRAC:.0%} (floors: planned >= {MIN_PLANNED}, "
           f"groups >= {MIN_GROUPS}).  log={CUEBOT_LOG}\n", flush=True)
     t0 = time.time()
@@ -96,7 +96,7 @@ def main():
     elif frac > 100.0 * MAX_FRAC:
         print(f"FAIL: raceLost {race} / planned {planned} = {frac:.1f}% of planned "
               f"(floor {100.0 * MAX_FRAC:.1f}%), across {peak_groups} host-spec "
-              f"groups. The planner is re-planning a layer across groups and losing "
+              f"groups. Maestro is re-planning a layer across groups and losing "
               f"the copies to the version race: the cross-group dedup is not "
               f"holding.", flush=True)
     else:

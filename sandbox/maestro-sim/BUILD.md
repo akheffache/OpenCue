@@ -37,7 +37,7 @@ $PGBIN/psql -h127.0.0.1 -p5433 -Ucue -dpostgres -c "CREATE DATABASE cuebot;"
 # apply migrations in version order:
 cd cuebot/src/main/resources/conf/ddl/postgres/migrations
 for f in $(ls *.sql | sort -t_ -k1.2 -n); do $PGBIN/psql -h127.0.0.1 -p5433 -Ucue -dcuebot -v ON_ERROR_STOP=1 -q -f "$f"; done
-# base data: dept/services/config from seed_data.sql + scheduler-sim/sim_seed.sql
+# base data: dept/services/config from seed_data.sql + sandbox/maestro-sim/sim_seed.sql
 ```
 
 ## Build / run cuebot (as your own user, JDK 17, wrapper 7.6.2)
@@ -47,12 +47,12 @@ is required. Remove cuebot/.gradle if you hit `checksums.lock (Permission denied
 ```bash
 cd cuebot && env \
   CUEBOT_DB_URL="jdbc:postgresql://127.0.0.1:5433/cuebot" CUEBOT_DB_USER=cue CUEBOT_DB_PASSWORD= \
-  SCHEDULER_ENABLED=true SCHEDULER_INTERVAL_MS=250 SCHEDULER_RESERVATIONS_ENABLED=false \
+  MAESTRO_ENABLED=true MAESTRO_INTERVAL_MS=250 MAESTRO_RESERVATIONS_ENABLED=false \
   ./gradlew bootRun -g /tmp/ghome-$USER -Dorg.gradle.java.home=/tmp/jdk-17.0.2 --console=plain >/tmp/cuebot.log 2>&1
 ```
 gRPC serves on **8443**. Compile-only check: swap `bootRun` for `compileJava`
 (note `-Werror -Xlint:all` is on — warnings fail the build). Unit tests:
-`./gradlew test --tests "...SchedulerTests"`.
+`./gradlew test --tests "...MaestroTests"`.
 
 ## CRITICAL launch pattern (process management)
 Launch long-running procs (cuebot, pinger, fake_rqd) with the Bash tool's

@@ -17,7 +17,7 @@ controls. A real server counts every consumer, so this one does too:
 The farm's share is read straight from Postgres (RUNNING frames whose layer
 declares the license in CUE_LICENSES), which is the same reality RQD is
 enacting. That closed loop is what makes the scenario a real test: if the
-planner over-books, this server's next sample shows it, and the watcher sees the
+Maestro over-books, this server's next sample shows it, and the watcher sees the
 pool oversubscribed.
 
 It is also deliberately BEHIND. It re-reads the farm only every
