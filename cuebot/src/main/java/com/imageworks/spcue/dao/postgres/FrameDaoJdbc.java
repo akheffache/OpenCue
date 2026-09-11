@@ -429,14 +429,14 @@ public class FrameDaoJdbc extends JdbcDaoSupport implements FrameDao {
         for (com.imageworks.spcue.dispatcher.FrameBooking b : bookings) {
             VirtualProc proc = b.proc;
             DispatchFrame frame = b.frame;
-            startParams.add(
-                    new Object[] {FrameState.RUNNING.toString(), proc.hostName, proc.coresReserved,
-                            proc.memoryReserved, proc.gpusReserved, proc.gpuMemoryReserved,
-                            frame.getFrameId(), FrameState.WAITING.toString(), frame.getVersion()});
+            startParams.add(new Object[] {FrameState.RUNNING.toString(), proc.hostName,
+                    proc.coresReserved, proc.memoryReserved, proc.gpusReserved,
+                    proc.gpuMemoryReserved, frame.getFrameId(), FrameState.WAITING.toString(),
+                    frame.getVersion(), proc.getHostId()});
         }
         int[] counts;
         try {
-            counts = getJdbcTemplate().batchUpdate(UPDATE_FRAME_STARTED, startParams);
+            counts = getJdbcTemplate().batchUpdate(updateFrameStartedSql(), startParams);
         } catch (DataAccessException e) {
             throw new FrameReservationException(e.getCause());
         }
