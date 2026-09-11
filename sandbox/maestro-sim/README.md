@@ -23,6 +23,8 @@ several bugs.
 | `register_hosts.py` | register all hosts via RQD ReportRqdStartup |
 | `rqd_report.py [int]` | faithful host **+ running-frame** status heartbeat; refreshes `proc.ts_ping` so the 300s orphan sweep behaves like prod |
 | `status_pinger.py` / `status_pinger_fast.py` | older empty-frame heartbeat (kept; superseded by `rqd_report.py`) |
+| `fake_license.py [secs]` | fake license server: three pools (hengine host-based, katana + maya floating), counts the farm's own usage plus artist holds, deliberately sampled behind |
+| `license_reporter.py [secs]` | the external reporter: creates the limit records and feeds the server's view to cuebot over `LimitInterface.ReportUsage` (cuebot never polls a license server itself) |
 | `fake_rqd.py [threads]` | fake RQD gRPC server on :8444; runs+completes frames. Used by new, old, and `rust --rust-real-launch`. `threads`=completion-report concurrency (1=serial, 64=concurrent RQDs) |
 | `rqd_complete.py [int] [memfail]` | default `--mode rust`: polls the proc table for frames the Rust scheduler booked (dry-run) and reports them complete to cuebot after their `sim_model` run-time — the DB-poll analogue of `fake_rqd.py` |
 | `gen_jobs.py` | submit a realistic job mix via LaunchSpec |
@@ -51,8 +53,8 @@ torn-down sim that writes its own graphs — then prints a PASS/FAIL summary
 | **PRIORITY_STARVING** | a low-priority stream survives a high-priority flood (stays above a 3% floor) |
 | **RESERVATIONS** | stranded wide jobs are rescued by reservations + backfill and actually run |
 | **LIMIT** | a global license cap (`limit_record.int_max_value`) holds concurrent running frames at the cap under a deep backlog |
-| **LICENSE** | LIVE application licenses (hengine host-based, katana + maya floating) served by a fake license server that counts the farm's own usage AND artist holds: no pool ever oversubscribed, seats shared on host-based pools, unlicensed control unaffected, artists get seats mid-run (headroom), denials requeued with zero retries |
-| **LICENSE_NO_HOSTS** | same, but the provider reports only COUNTS (no `hosts` list) — the realistic `sesictrl` shape for Houdini: cuebot must bound new seats by `available` while blind to holders outside the cue |
+| **LICENSE** | LIVE application licenses as limits (hengine `HOST`, katana + maya `FRAME`) served by a fake license server that counts the farm's own usage AND artist holds, fed to cuebot by an external reporter over `LimitInterface.ReportUsage`: no pool ever oversubscribed, seats shared on host-based pools, unlicensed control unaffected, artists get seats mid-run (headroom the reporter withholds), denials requeued with zero retries |
+| **LICENSE_NO_HOSTS** | same, but the server reports only COUNTS (no `hosts` list) — the realistic `sesictrl` shape for Houdini. With no holder snapshot to post, the reporter must size the pool by `available` via `SetMaxValue` and leave the limit never-reported, so cuebot keeps counting every running proc instead of only what lands inside the settle window |
 | **FOLDER** | a folder/group core ceiling (`folder_resource.int_max_cores`) holds the folder's running cores at the cap under a deep backlog |
 | **LOCALITY** | the same-layer locality bonus steers refills: newly booked procs land on hosts already running their layer (refill affinity above a calibrated floor; near-random without the bonus) |
 | **DEPENDS** | dependency correctness: no frame ever RUNS with unsatisfied depends, while depends satisfy and previously-gated frames run (coverage floors) |
@@ -126,7 +128,7 @@ Run `python metrics.py 120` against a live run anytime.
 | `--priority-spread SECS` | `0` | PRIORITY test: 10 classes at pri 10..100 contend with equal backlog; normally driven by `--verify` (pair with a small `--hosts` so it is oversubscribed). |
 | `--priority-starve SECS` | `0` | PRIORITY_STARVING test: a deep high-priority flood; the low stream must stay above a 3% floor. Normally driven by `--verify`. |
 | `--limit-test SECS` | `0` | LIMIT test: attach one global license cap (`SIM_LIMIT_MAX`, default 50) to a deep flood of 1-core frames and assert concurrent running never exceeds it. Normally driven by `--verify`. |
-| `--license-test SECS` | `0` | LICENSE test: start the fake license server (fake_license.py) and flood layers declaring `CUE_LICENSES`; assert no pool ever oversubscribed, seats shared, unlicensed control unaffected, artists get seats mid-run, denials requeued for free. `SIM_LIC_NO_HOSTS=1` serves counts only (the SESI shape). Normally driven by `--verify`. |
+| `--license-test SECS` | `0` | LICENSE test: start the fake license server (fake_license.py) plus its reporter (license_reporter.py) and flood layers bound to the licence limits; assert no pool ever oversubscribed, seats shared, unlicensed control unaffected, artists get seats mid-run, denials requeued for free. `SIM_LIC_NO_HOSTS=1` serves counts only (the SESI shape). Normally driven by `--verify`. |
 | `--with-licenses` | off | run the licensed load ALONGSIDE another scenario (used by FAILOVER) so the promoted standby is proven to take over the pools without oversubscribing. |
 | `--folder-test SECS` | `0` | FOLDER test: cap the sim folder (`SIM_FOLDER_MAX` cores, default 50), flood narrow work into it, and assert the folder's running cores never exceed the cap. Normally driven by `--verify`. |
 | `--locality-test SECS` | `0` | LOCALITY test: measure refill affinity (fraction of newly booked procs landing on a host already running their layer); PASS at `SIM_LOCALITY_MIN_HIT` (default 0.15; calibrated: bonus-ON ~29%, bonus-OFF ~1.3% on the full farm). Pair with `--feed`; control-run the bonus off with `SIM_LOCALITY_ENABLED=false`. Normally driven by `--verify`. |

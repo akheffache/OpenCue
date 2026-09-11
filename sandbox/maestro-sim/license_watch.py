@@ -65,7 +65,6 @@ PSQL = spec.psql_cmd()
 CSV = os.environ.get("SIM_LICENSE_CSV", "")
 PORT = int(os.environ.get("SIM_LIC_PORT", "9101"))
 STATE_URL = f"http://127.0.0.1:{PORT}/state"
-ENV_KEY = os.environ.get("SIM_LIC_ENV_KEY", "CUE_LICENSES")
 TOKEN = "simlicense"
 # Seat sharing bar for the host-based pool: frames must clear this multiple of
 # the seat count, or the per-host gate is being over-strict.
@@ -114,32 +113,33 @@ def farm_usage():
     """
     frames, hosts = {}, {}
     for row in _rows(
-            f"SELECT le.str_value, f.str_host FROM layer_env le "
-            f"JOIN frame f ON f.pk_layer = le.pk_layer "
-            f"WHERE le.str_key = '{ENV_KEY}' AND f.str_state = 'RUNNING';"):
+            "SELECT lr.str_name, f.str_host FROM layer_limit ll "
+            "JOIN limit_record lr ON lr.pk_limit_record = ll.pk_limit_record "
+            "JOIN frame f ON f.pk_layer = ll.pk_layer "
+            "WHERE f.str_state = 'RUNNING';"):
         if len(row) < 2:
             continue
-        raw, host = row[0], (row[1] or "").strip().lower()
-        for name in [p.strip().lower() for p in raw.split(",") if p.strip()]:
-            frames[name] = frames.get(name, 0) + 1
-            if host:
-                hosts.setdefault(name, set()).add(host)
+        name, host = row[0].strip().lower(), (row[1] or "").strip().lower()
+        if not name:
+            continue
+        frames[name] = frames.get(name, 0) + 1
+        if host:
+            hosts.setdefault(name, set()).add(host)
     return frames, hosts
 
 
 def unlicensed_running():
     """RUNNING frames of this test's UNLICENSED layers (the control group).
 
-    A layer is unlicensed when it has no CUE_LICENSES row at all, or an empty
-    one. It must be entirely unaffected by licensing.
+    A layer is unlicensed when it is bound to no limit at all. It must be
+    entirely unaffected by licensing.
     """
     return _scalar(
         f"SELECT count(*) FROM frame f "
         f"JOIN job j ON j.pk_job = f.pk_job "
-        f"LEFT JOIN layer_env le ON le.pk_layer = f.pk_layer "
-        f"AND le.str_key = '{ENV_KEY}' "
+        f"LEFT JOIN layer_limit ll ON ll.pk_layer = f.pk_layer "
         f"WHERE j.str_name LIKE '%{TOKEN}%' AND f.str_state = 'RUNNING' "
-        f"AND (le.str_value IS NULL OR le.str_value = '');")
+        f"AND ll.pk_layer IS NULL;")
 
 
 def waiting_backlog():

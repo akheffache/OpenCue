@@ -15,7 +15,7 @@ controls. A real server counts every consumer, so this one does too:
     available = total - (frames the farm is running) - (seats artists hold)
 
 The farm's share is read straight from Postgres (RUNNING frames whose layer
-declares the license in CUE_LICENSES), which is the same reality RQD is
+is bound to the license's limit), which is the same reality RQD is
 enacting. That closed loop is what makes the scenario a real test: if the
 Maestro over-books, this server's next sample shows it, and the watcher sees the
 pool oversubscribed.
@@ -63,7 +63,6 @@ PORT = int(os.environ.get("SIM_LIC_PORT", "9101"))
 # which is the window cuebot's in-flight correction has to cover.
 SAMPLE_S = float(os.environ.get("SIM_LIC_SAMPLE_S", "4.0"))
 PSQL = spec.psql_cmd()
-ENV_KEY = os.environ.get("SIM_LIC_ENV_KEY", "CUE_LICENSES")
 
 # Pool sizes. Deliberately small against a farm that could run far more, so the
 # licenses -- not the cores -- are what binds.
@@ -78,6 +77,10 @@ ART_HOSTS = [h for h in os.environ.get(
 # Katana seats artists try to take, and when they start trying. They can only
 # get what is genuinely free, so this succeeding IS the headroom proof.
 ART_KATANA = int(os.environ.get("SIM_LIC_ART_KATANA", "5"))
+# One workstation per katana seat an artist takes. A floating license server
+# reports WHICH machines hold its tokens, so these are the names the farm has to
+# see holding seats it cannot have.
+ART_KATANA_HOSTS = [f"artkat{i:02d}" for i in range(1, ART_KATANA + 1)]
 ART_KATANA_AT = float(os.environ.get("SIM_LIC_ART_KATANA_AT", "60"))
 # SIM_LIC_NO_HOSTS=1 serves the contract WITHOUT the optional per-license `hosts`
 # list, which is how a provider that only exposes counts behaves. cuebot is then
@@ -91,6 +94,7 @@ _state = {
     "queried_at": 0,
     "farm_frames": {},   # license -> RUNNING frames the farm holds
     "farm_hosts": {},    # license -> distinct farm hosts running it
+    "farm_host_frames": {},  # license -> {host: frames it runs}
     "art_katana_held": 0,
     "art_katana_wanted": 0,
     "samples": 0,
@@ -109,23 +113,32 @@ def _rows(sql):
 def sample_farm():
     """What the farm is holding right now, per license name.
 
-    One pass over running licensed frames. str_value is the layer's raw
-    CUE_LICENSES value, so a layer declaring "katana,maya" is counted in BOTH
+    One pass over running frames of limit-bound layers. A layer bound to both
+    katana and maya has a layer_limit row for each, so it is counted in BOTH
     pools -- it really did check out one of each.
+
+    Returns (frames, hosts, per_host): total frames per license, the distinct
+    hosts running them, and each host's own frame count. A floating license is
+    checked out per process, so per_host is what the server reports as that
+    machine's token count.
     """
-    frames, hosts = {}, {}
+    frames, hosts, per_host = {}, {}, {}
     for row in _rows(
-            f"SELECT le.str_value, f.str_host FROM layer_env le "
-            f"JOIN frame f ON f.pk_layer = le.pk_layer "
-            f"WHERE le.str_key = '{ENV_KEY}' AND f.str_state = 'RUNNING';"):
+            "SELECT lr.str_name, f.str_host FROM layer_limit ll "
+            "JOIN limit_record lr ON lr.pk_limit_record = ll.pk_limit_record "
+            "JOIN frame f ON f.pk_layer = ll.pk_layer "
+            "WHERE f.str_state = 'RUNNING';"):
         if len(row) < 2:
             continue
-        raw, host = row[0], (row[1] or "").strip().lower()
-        for name in [p.strip().lower() for p in raw.split(",") if p.strip()]:
-            frames[name] = frames.get(name, 0) + 1
-            if host:
-                hosts.setdefault(name, set()).add(host)
-    return frames, hosts
+        name, host = row[0].strip().lower(), (row[1] or "").strip().lower()
+        if not name:
+            continue
+        frames[name] = frames.get(name, 0) + 1
+        if host:
+            hosts.setdefault(name, set()).add(host)
+            counts = per_host.setdefault(name, {})
+            counts[host] = counts.get(host, 0) + 1
+    return frames, hosts, per_host
 
 
 def sampler(t0):
@@ -139,11 +152,12 @@ def sampler(t0):
         # roughly one tick's worth. A real license server's timestamp means the
         # same thing: as of when the numbers were true.
         as_of = int(time.time())
-        frames, hosts = sample_farm()
+        frames, hosts, per_host = sample_farm()
         elapsed = time.time() - t0
         with _lock:
             _state["farm_frames"] = frames
             _state["farm_hosts"] = {k: sorted(v) for k, v in hosts.items()}
+            _state["farm_host_frames"] = per_host
             _state["queried_at"] = as_of
             _state["samples"] += 1
             # Artists start asking for katana partway through the run. They are
@@ -159,10 +173,17 @@ def sampler(t0):
         time.sleep(SAMPLE_S)
 
 
+def _floating_hosts(counts):
+    """Holder rows for a floating pool: one per machine, carrying the number of
+    tokens that machine has checked out (one per process)."""
+    return [{"host": h, "count": n} for h, n in sorted(counts.items()) if n > 0]
+
+
 def licenses_payload():
     with _lock:
         frames = dict(_state["farm_frames"])
         hosts = {k: list(v) for k, v in _state["farm_hosts"].items()}
+        per_host = {k: dict(v) for k, v in _state["farm_host_frames"].items()}
         queried_at = _state["queried_at"]
         art_katana = _state["art_katana_held"]
 
@@ -185,8 +206,10 @@ def licenses_payload():
             "total": KATANA_TOTAL,
             "available": max(0, KATANA_TOTAL - frames.get("katana", 0) - art_katana),
             "host_based": False,
-            "hosts": [] if NO_HOSTS else [{"host": h, "count": 1}
-                                          for h in sorted(hosts.get("katana", []))],
+            "hosts": [] if NO_HOSTS else (
+                _floating_hosts(per_host.get("katana", {}))
+                + [{"host": h, "count": 1}
+                   for h in ART_KATANA_HOSTS[:art_katana]]),
         },
         {
             "name": "maya",
@@ -194,8 +217,7 @@ def licenses_payload():
             "total": MAYA_TOTAL,
             "available": max(0, MAYA_TOTAL - frames.get("maya", 0)),
             "host_based": False,
-            "hosts": [] if NO_HOSTS else [{"host": h, "count": 1}
-                                          for h in sorted(hosts.get("maya", []))],
+            "hosts": [] if NO_HOSTS else _floating_hosts(per_host.get("maya", {})),
         },
     ]
     return {"queried_at": queried_at, "licenses": out}

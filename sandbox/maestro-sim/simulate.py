@@ -406,6 +406,7 @@ WORKLOAD_PATTERNS = ["feed.py", "inject_big.py", "inject_priority_starve.py",
                      "priority_spread_watch.py", "inject_limit.py",
                      "limit_watch.py", "inject_folder.py", "folder_watch.py",
                      "inject_license.py", "license_watch.py", "fake_license.py",
+                     "license_reporter.py",
                      "inject_capdrop.py", "capdrop_watch.py",
                      "inject_prodenv.py", "prodenv_watch.py",
                      "inject_layercap.py", "layercap_watch.py",
@@ -700,7 +701,7 @@ def ensure_cuebot_built():
     log("  cuebot build ready (cache warm)")
 
 
-def license_env(script=False):
+def license_env():
     """Live-license settings for a cuebot process, or {} when licensing is off.
 
     EVERY cuebot gets these, not just instance 0. In production they come from one
@@ -722,28 +723,24 @@ def license_env(script=False):
     """
     if os.environ.get("SIM_LICENSE_TEST") != "1":
         return {}
-    port = os.environ.get("SIM_LIC_PORT", "9101")
-    url = f"http://127.0.0.1:{port}/licenses"
+    # Cuebot no longer polls a license server: a limit carries the pool, and an
+    # external reporter (license_reporter.py) feeds it the server's view. So the
+    # knobs here are the limit ones, and the provider URL belongs to the reporter
+    # rather than to cuebot.
     return {
-        # SIM_LIC_PROVIDER=" " (blank) drops the provider while leaving layers
-        # declaring CUE_LICENSES, which is the misconfiguration case: cuebot has no
-        # way to learn what is free, so it must HOLD that work rather than book it
-        # blind. Used to prove the fail-closed path, since there is deliberately no
-        # enable flag to test instead.
-        "MAESTRO_LICENSE_PROVIDER": os.environ.get(
-            "SIM_LIC_PROVIDER",
-            f"script:curl -sf --noproxy '*' {url}" if script else url),
-        "MAESTRO_LICENSE_POLL_SECONDS": os.environ.get("SIM_LIC_POLL_S", "4"),
-        "MAESTRO_LICENSE_STALE_SECONDS": os.environ.get("SIM_LIC_STALE_S", "60"),
-        # Seats held back for interactive users. katana carries the headroom so the
-        # scenario can prove an artist still gets a seat while the farm is
-        # saturated; the other pools run with none.
-        "MAESTRO_LICENSE_HEADROOM_KATANA": os.environ.get("SIM_LIC_HEADROOM_KATANA", "8"),
-        # Exit status fake_rqd uses for an injected license denial. Such a frame
-        # must go back to WAITING without spending a retry, so a busy pool never
-        # marches a layer to DEAD.
-        "MAESTRO_LICENSE_DENIED_EXIT_STATUSES":
-            os.environ.get("SIM_LIC_DENY_STATUS", "203"),
+        # Must sit below the reporter's poll interval, or every second report is
+        # rejected as RATE_LIMITED and the limits drift stale (stale = not
+        # blocking).
+        "LIMIT_MIN_REPORT_INTERVAL_SECONDS": os.environ.get("SIM_LIC_MIN_REPORT_S", "2"),
+        # How far back the pending scan reaches before a limit's watermark, so a
+        # frame booked just before a snapshot is still counted. Roughly twice the
+        # reporter's poll interval.
+        "LIMIT_SETTLE_WINDOW_SECONDS": os.environ.get("SIM_LIC_SETTLE_S", "10"),
+        "LIMIT_USAGE_REFRESH_SECONDS": os.environ.get("SIM_LIC_USAGE_REFRESH_S", "5"),
+        # Pack host-limited work onto machines already holding a token, so the
+        # host-based pool (hengine) spends seats on as few machines as possible.
+        "DISPATCHER_LIMIT_AFFINITY_ORDERING_ENABLED":
+            os.environ.get("SIM_LIC_AFFINITY", "true"),
     }
 
 
@@ -896,7 +893,7 @@ def start_extra_cuebot(instance, mode, reservations=False, block_seconds=60,
     })
     # Same licensing DATA as instance 0, but via the script: provider flavour,
     # so a promoted standby exercises the vendor-CLI transport for real.
-    env.update(license_env(script=True))
+    env.update(license_env())
     if frame_cores_max > 0:
         env["DISPATCHER_FRAME_CORES_MAX"] = str(frame_cores_max)
     java = os.path.join(JDK17, "bin", "java") if (JDK17 and os.path.isdir(JDK17)) else "java"
@@ -1172,16 +1169,27 @@ def start_layercap_solo_injector(duration):
 
 
 def start_license_server(duration):
-    """Bring up the fake license server BEFORE cuebot polls it, so Maestro's
-    first sample is real rather than a failed fetch."""
+    """Bring up the license server and its reporter BEFORE any licensed work.
+
+    Cuebot never polls the server itself -- the reporter carries its view in over
+    LimitInterface.ReportUsage -- so the reporter is what has to be running early:
+    it also creates the limit_record rows the injector's layers bind to, and a
+    limit that has never been reported does not gate.
+    """
     log(f"starting fake license server on 127.0.0.1:{os.environ.get('SIM_LIC_PORT','9101')} "
         f"(hengine seats / katana / maya, re-reads the farm every "
         f"{os.environ.get('SIM_LIC_SAMPLE_S','4')}s) ...")
     spawn(["fake_license.py", str(duration)], f"{FARM}/fake_license.log")
+    # +30s so the reporter outlives the watch window: limits must keep being fed
+    # right to the end, or they go stale and stop blocking before the verdict.
+    log(f"starting license reporter -> LimitInterface.ReportUsage "
+        f"({'counts only' if os.environ.get('SIM_LIC_NO_HOSTS') == '1' else 'holder snapshots'}"
+        f", every {os.environ.get('SIM_LIC_POLL_S','4')}s) ...")
+    spawn(["license_reporter.py", str(duration + 30)], f"{FARM}/license_reporter.log")
 
 
 def start_license_injector(duration):
-    log(f"starting LICENSE injector (layers declaring CUE_LICENSES: hengine "
+    log(f"starting LICENSE injector (layers bound to limits: hengine "
         f"host-based, katana + maya floating, plus an unlicensed control, "
         f"for {duration}s) ...")
     spawn(["inject_license.py", str(duration)], f"{FARM}/inject_license.log")
@@ -2264,8 +2272,8 @@ def main():
                          "Pair with --feed.")
     ap.add_argument("--with-licenses", action="store_true",
                     help="run licensed load ALONGSIDE another scenario: starts the "
-                         "fake license server and the CUE_LICENSES injector and "
-                         "turns on maestro.license.*, but leaves the watcher to "
+                         "fake license server, its reporter and the licensed "
+                         "injector, but leaves the watcher to "
                          "the host scenario. Used by FAILOVER, where the promoted "
                          "standby must pick up licensing correctly (it derives "
                          "in-flight seats from the DB precisely so a new leader "
@@ -2275,12 +2283,13 @@ def main():
                          "availability instead of a static cap. Starts a fake "
                          "license server (fake_license.py: hengine host-based, "
                          "katana + maya floating) that counts the farm's own usage "
-                         "plus artist holds, floods work whose layers declare "
-                         "CUE_LICENSES, and asserts no pool is ever oversubscribed, "
+                         "plus artist holds, feeds it to cuebot through "
+                         "license_reporter.py (LimitInterface.ReportUsage), floods "
+                         "work whose layers are bound to those limits, and asserts "
+                         "no pool is ever oversubscribed, "
                          "seats are shared on host-based pools, unlicensed work is "
                          "untouched, and artists still get seats mid-run (the "
-                         "headroom proof). Sets SIM_LICENSE_TEST=1 so cuebot runs "
-                         "against the fake provider.")
+                         "headroom the reporter withholds). Sets SIM_LICENSE_TEST=1.")
     ap.add_argument("--locality-test", type=int, default=0, metavar="SECS",
                     help="LOCALITY test: measure refill affinity -- of newly booked "
                          "procs whose layer already ran somewhere, the fraction "
@@ -2390,8 +2399,8 @@ def main():
     if args.verify:
         sys.exit(run_verify())
 
-    # LICENSE: every cuebot reads this to turn maestro.license.* on, and the
-    # server/injector/watcher take the port and env key from the same place.
+    # LICENSE: every cuebot reads this to pick up the limit settings, and the
+    # server/reporter/injector/watcher take the port from the same place.
     # --with-licenses runs the licensed load under ANOTHER scenario (FAILOVER),
     # so it configures cuebot but leaves that scenario's watcher in charge.
     if args.license_test or args.with_licenses:
@@ -2400,7 +2409,10 @@ def main():
         # Have fake_rqd fail a slice of frames with the license-denied status, so
         # the requeue path is exercised for real: those frames must come back
         # WAITING with no retry spent, and none may end DEAD.
-        os.environ.setdefault("SIM_LIC_DENY_RATE", "0.05")
+        # Low rate on purpose: a denial now also parks the layer for the rule's
+        # backoff (a minute, the smallest the schema allows), so a heavy rate
+        # would idle the denial pool for most of the window instead of testing it.
+        os.environ.setdefault("SIM_LIC_DENY_RATE", "0.02")
 
     # PARITY: hosts must advertise a multi-OS SP_OS BEFORE the farm registers /
     # pingers spawn (children read SIM_HOST_OS at import, see farm_spec.HOST_OS).
@@ -2932,10 +2944,9 @@ def main():
                     if excess > lic_worst.get(n, 0):
                         lic_worst[n] = excess
                     parts.append(f"{n} {use}+{holds.get(n, 0)}/{totals[n]}")
-                out = psql(f"SELECT count(*) FROM frame f "
-                           f"JOIN layer_env le ON le.pk_layer = f.pk_layer "
-                           f"WHERE le.str_key='CUE_LICENSES' AND le.str_value <> '' "
-                           f"AND f.ts_started > '{kill_ts}';")
+                out = psql(f"SELECT count(DISTINCT f.pk_frame) FROM frame f "
+                           f"JOIN layer_limit ll ON ll.pk_layer = f.pk_layer "
+                           f"WHERE f.ts_started > '{kill_ts}';")
                 lic_started_after = int(out.stdout.strip() or 0)
                 lic_note = (f"  licensed started since kill: {lic_started_after}  "
                             f"pools: {' | '.join(parts)}")

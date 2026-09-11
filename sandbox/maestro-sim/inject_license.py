@@ -1,12 +1,13 @@
 """LICENSE test: does Maestro respect LIVE license availability?
 
-Companion to fake_license.py (the license server) and license_watch.py (the
-verdict). Floods the farm with work that needs application licenses, declared
-the way a submitter declares them -- in the layer's environment:
+Companion to fake_license.py (the license server), license_reporter.py (which
+feeds the server's view to cuebot) and license_watch.py (the verdict). Floods
+the farm with work that needs application licenses, declared the way a submitter
+declares them -- by binding the layer to the limit that stands for the pool:
 
-    <env><key name="CUE_LICENSES">katana,maya</key></env>
+    <limits><limit>katana</limit><limit>maya</limit></limits>
 
-and cuebot gates placement on what the license server says is free RIGHT NOW,
+and cuebot gates placement on what the reporter last said was free RIGHT NOW,
 not on a number an admin typed. The backlog is far deeper than any pool, so the
 licenses are the only thing that can hold concurrency down.
 
@@ -43,8 +44,6 @@ import farm_spec as spec
 
 CUEBOT = spec.GRPC
 DURATION = int(sys.argv[1]) if len(sys.argv) > 1 else 180
-ENV_KEY = os.environ.get("SIM_LIC_ENV_KEY", "CUE_LICENSES")
-
 # Layer flavours and their weights. Licensed work dominates so the pools are
 # under real pressure, with a solid slice of unlicensed work as the control.
 FLAVOURS = [
@@ -83,16 +82,24 @@ def make_job(name, rng):
         nf = rng.randint(FRAMES_MIN, FRAMES_MAX)
         lic = _pick(rng)
         # DTD order: cmd,range,chunk,cores,threadable,memory,...,tags,limits,env,services
-        env = (f'<env><key name="{ENV_KEY}">{lic}</key></env>' if lic else "")
+        # Licences are limits: the layer is BOUND to each pool it needs, which is
+        # what puts a layer_limit row in front of the dispatch gate.
+        limits = ("<limits>"
+                  + "".join(f"<limit>{n}</limit>" for n in lic.split(",") if n)
+                  + "</limits>") if lic else ""
         # 1 core per frame = 1 license unit, and cores never bind before the
         # licenses do.
+        # The layer name carries its pools: an exit status can be claimed by only
+        # one limit, so fake_rqd has to know which frames may be denied, and the
+        # frame name is all it gets.
+        lname = f"lyr{li}" + (("-" + lic.replace(",", "-")) if lic else "")
         layers.append(
-            f'      <layer name="lyr{li}" type="Render"><cmd>/bin/true</cmd>'
+            f'      <layer name="{lname}" type="Render"><cmd>/bin/true</cmd>'
             f'<range>1-{nf}</range><chunk>1</chunk>'
             f'<cores>{sim_model.CORE_POINTS}</cores>'
             f'<threadable>0</threadable><memory>512mb</memory>'
             f'<tags>{spec.TAG}</tags>'
-            f'{env}'
+            f'{limits}'
             f'<services><service>shell</service></services></layer>')
     return (f'  <job name="{name}"><paused>false</paused><priority>100</priority>'
             f'<maxcores>80000</maxcores>\n    <layers>\n'
@@ -116,11 +123,14 @@ def waiting():
 
 
 def licensed_running():
-    """RUNNING frames that hold at least one license (any pool)."""
-    return _scalar(f"SELECT count(*) FROM frame f "
-                   f"JOIN layer_env le ON le.pk_layer = f.pk_layer "
-                   f"WHERE le.str_key='{ENV_KEY}' AND le.str_value <> '' "
-                   f"AND f.str_state='RUNNING';", int, -1)
+    """RUNNING frames that hold at least one license (any pool).
+
+    DISTINCT because a layer bound to two pools has two layer_limit rows and is
+    still one running frame.
+    """
+    return _scalar("SELECT count(DISTINCT f.pk_frame) FROM frame f "
+                   "JOIN layer_limit ll ON ll.pk_layer = f.pk_layer "
+                   "WHERE f.str_state='RUNNING';", int, -1)
 
 
 def util_pct():
