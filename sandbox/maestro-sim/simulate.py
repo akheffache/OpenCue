@@ -1490,12 +1490,18 @@ def _verify_check(name, gdir, logp, cblog):
         pm = re.search(r"peak concurrent running=(\d+)", txt)
         cap = int(cm.group(1)) if cm else -1
         peak = int(pm.group(1)) if pm else -1
-        # Waitlist cross-check: the capped flood's backlog must be classified
-        # 'limit' at some point (churn re-admits the layer every tick).
+        # Waitlist cross-check: the capped flood's backlog must actually be
+        # classified as limit-blocked at some point (churn re-admits the layer
+        # every tick), or the cap was never what held concurrency down.
+        #
+        # That bucket is 'license', not 'limit'. Maestro's waitlistReason splits
+        # them the other way round from what the names suggest: 'limit' is a job
+        # / show / folder cap, while an exhausted limit-record budget -- which is
+        # exactly what this scenario caps -- is reported as 'no license'.
         wl = wl_peaks()
-        ok = bool(re.search(r"(?m)^PASS:", txt)) and wl["limit"] > 0
+        ok = bool(re.search(r"(?m)^PASS:", txt)) and wl["license"] > 0
         return ok, (f"peak concurrent running {peak} vs cap {cap}; "
-                    f"waitlist limit peak {wl['limit']}")
+                    f"waitlist limit-budget peak {wl['license']}")
     if name == "PRODENV":
         # The watcher's own verdict (mirrors tracked, caps decayed, coverage
         # floors met), plus the wedge signatures must be absent from the cuebot
