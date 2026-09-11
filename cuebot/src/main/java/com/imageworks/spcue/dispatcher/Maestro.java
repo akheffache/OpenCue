@@ -57,6 +57,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import com.imageworks.spcue.DispatchHost;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.VirtualProc;
+import com.imageworks.spcue.dao.postgres.DispatchQuery;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.service.HostManager;
 import com.imageworks.spcue.rqd.RqdClient;
@@ -122,13 +123,9 @@ public class Maestro extends JdbcDaoSupport {
     static final int PROBE_FRAMES = 8;
     private volatile long memPerCoreKb = 0;
 
-    // Seat bonus for host-based licenses (one checkout per machine): subtracted per seated pool so
-    // placement packs licensed work onto the fewest hosts. Sized above the E-PVM spread. See doc.
-    private volatile double licenseSeatBonus = 16.0;
-
-    // Live application-license availability, null until the first tick builds it. See
-    // LicenseSource.
-    private volatile LicenseSource licenseSource;
+    // Seat bonus for HOST-type limits (one license checkout per machine): subtracted per seated
+    // pool so placement packs limited work onto the fewest hosts. Sized above the E-PVM spread.
+    private volatile double limitSeatBonus = 16.0;
 
     // Spring config; scheduler.* properties read once in startSchedulerPoolsIfNeeded().
     @Autowired
@@ -213,15 +210,16 @@ public class Maestro extends JdbcDaoSupport {
     // as fields so the phase methods share them without threading a dozen parameters.
     private final Map<String, Integer> jobCoresUsed = new HashMap<>();
     private final Map<String, Integer> showCoresUsed = new HashMap<>();
-    private final Map<String, Integer> limitUsed = new HashMap<>();
     private final Map<String, Integer> folderUsed = new HashMap<>();
     private final Map<String, Integer> folderMaxCp = new HashMap<>();
     private final Map<String, Integer> folderRunSeed = new HashMap<>();
     private final Map<String, String> jobFolderCap = new HashMap<>();
-    private final Map<String, List<String>> layerLicenses = new HashMap<>();
-    private final Map<String, LicenseSource.LicenseBudget> licenseBudgets = new HashMap<>();
-    private final Map<String, Integer> licenseUsed = new HashMap<>();
-    private final Map<String, Set<String>> licenseSeats = new HashMap<>();
+    private final Map<String, List<String>> layerLimits = new HashMap<>();
+    private final Map<String, LimitBudget> limitBudgets = new HashMap<>();
+    private final Map<String, Integer> limitUsed = new HashMap<>();
+    private final Map<String, Set<String>> limitSeats = new HashMap<>();
+    // True once this tick's limit budgets are loaded; reset by clearTickScratch.
+    /* package for tests */ boolean limitBudgetsResolved = false;
     private final Set<String> seenLayerIds = new HashSet<>();
     private final List<ReservationRequest> reservationReqs = new ArrayList<>();
     // Waitlist tally: the last outcome seen for each candidate layer that still had waiting
@@ -353,12 +351,12 @@ public class Maestro extends JdbcDaoSupport {
     private int tickGranted = 0;
     private int tickBackfilled = 0;
     private long tickBackfilledCores = 0;
-    // Live licensing: frames booked against a license pool, and candidates a pool
-    // held back this tick (out of seats, or its sample was too stale to spend).
+    // Limit gating (license-style pools): frames booked against a gating limit,
+    // and candidates a limit's exhausted budget held back this tick.
     private int tickLicenseBooked = 0;
     private int tickLicenseHeld = 0;
-    // Planned frames dropped at commit time because a pool could not cover them
-    // (the plan read has no license clause; see the trim in doTick).
+    // Planned frames dropped at commit time because a limit could not cover them
+    // (the plan read is limit-blind; see the trim in doTick).
     private int tickLicenseTrimmed = 0;
     // Warn threshold: a group count near the host count means near-per-host fragmentation.
     // See warnIfGroupsFragmented.
@@ -406,16 +404,11 @@ public class Maestro extends JdbcDaoSupport {
         memPerCoreKb = env.getProperty("maestro.mem_per_core", Long.class, 0L);
         // Property name kept from the per-host-limit feature this supersedes, so
         // any site already setting it keeps its value.
-        licenseSeatBonus = env.getProperty("maestro.host_limit_seat_bonus", Double.class, 16.0);
+        limitSeatBonus = env.getProperty("maestro.host_limit_seat_bonus", Double.class, 16.0);
         wCores = env.getProperty("maestro.score_weight_cores", Double.class, 1.0);
         wMem = env.getProperty("maestro.score_weight_mem", Double.class, 1.0);
         wGpus = env.getProperty("maestro.score_weight_gpus", Double.class, 4.0);
         wGpuMem = env.getProperty("maestro.score_weight_gpu_mem", Double.class, 1.0);
-        // Live application licenses. Started here rather than wired as a bean so its poll thread's
-        // life matches Maestro's; layers without CUE_LICENSES simply never consult it.
-        LicenseSource ls = new LicenseSource(env, getJdbcTemplate());
-        ls.start();
-        licenseSource = ls;
         // Cadence of the consolidated INFO stat line (see maybeLogStat). Default
         // 5 minutes; lower it for a live incident, raise it to quiet the log.
         statIntervalMs =
@@ -520,18 +513,15 @@ public class Maestro extends JdbcDaoSupport {
             + "  COALESCE(ls.int_waiting_count, 0) AS waiting_frame_count, "
             + "  COALESCE(lu.int_clock_time_high, 0)     AS clock_time_high, "
             + "  COALESCE(lu.int_frame_success_count, 0) AS frame_success_count, "
-            // Limit (license-cap) accounting: the layer's most-constraining limit,
-            // its cap, and how many frames of that limit run farm-wide right now.
-            + "  lim.pk_limit_record AS limit_id, "
-            + "  COALESCE(lim.int_max_value, 0)   AS limit_max, "
-            + "  COALESCE(lu2.int_sum_running, 0) AS limit_running, "
+            // Limits bound to the layer, comma separated, NULL when none. The
+            // per-limit budgets (usage, thresholds, holder hosts) are resolved
+            // once per tick in resolveLimitBudgets, not per candidate row.
+            + "  (SELECT string_agg(ll.pk_limit_record, ',') "
+            + "     FROM layer_limit ll WHERE ll.pk_layer = l.pk_layer) AS limit_ids, "
             // Folder (group/dept) core cap: the job's folder, its ceiling, and the
             // folder's current running cores (ground truth = SUM of the folder's jobs).
             + "  j.pk_folder AS folder_id, "
             + "  COALESCE(fr.int_max_cores, -1) AS folder_max, "
-            // Application licenses the layer declares (CUE_LICENSES), comma
-            // separated, NULL when it declares none.
-            + "  le.str_value AS licenses, "
             + "  COALESCE(fu.folder_cores, 0)   AS folder_running "
             + "FROM   layer l "
             + "JOIN   job j           ON j.pk_job  = l.pk_job "
@@ -540,20 +530,6 @@ public class Maestro extends JdbcDaoSupport {
             + "JOIN   subscription sub ON sub.pk_show = j.pk_show AND sub.pk_alloc = ? "
             + "LEFT JOIN layer_usage lu ON lu.pk_layer = l.pk_layer "
             + "LEFT JOIN layer_stat  ls ON ls.pk_layer = l.pk_layer "
-            // The layer's most-constraining limit (smallest cap), one row per layer.
-            + "LEFT JOIN LATERAL ("
-            + "    SELECT ll.pk_limit_record, lr.int_max_value "
-            + "    FROM   layer_limit ll "
-            + "    JOIN   limit_record lr ON lr.pk_limit_record = ll.pk_limit_record "
-            + "    WHERE  ll.pk_layer = l.pk_layer "
-            + "    ORDER BY lr.int_max_value LIMIT 1) lim ON true "
-            // Farm-wide running count per limit (computed once, not per row).
-            + "LEFT JOIN ("
-            + "    SELECT ll2.pk_limit_record, SUM(ls2.int_running_count) AS int_sum_running "
-            + "    FROM   layer_limit ll2 "
-            + "    JOIN   layer_stat ls2 ON ls2.pk_layer = ll2.pk_layer "
-            + "    GROUP BY ll2.pk_limit_record) lu2 "
-            + "  ON lu2.pk_limit_record = lim.pk_limit_record "
             // Folder core ceiling + the folder's current running cores. Derived from
             // layer_stat.int_running_count (running frames x per-frame cores), the
             // same trigger-maintained counter the limit cap uses. It is robust to frame
@@ -576,14 +552,6 @@ public class Maestro extends JdbcDaoSupport {
             + "    JOIN   layer_stat ls2 ON ls2.pk_layer = l2.pk_layer "
             + "    WHERE  j2.str_state = 'PENDING' "
             + "    GROUP BY j2.pk_folder) fu ON fu.pk_folder = j.pk_folder "
-            // Live application licenses, carried on the candidate row so the
-            // Maestro needs no second round trip for them. Joined on pk_layer,
-            // which layer_env is indexed on (i_layer_env_pk_layer); asking the
-            // other way round, "which layers declare CUE_LICENSES", has no index
-            // to use and would scan every environment variable on the farm once
-            // per tick. At most one row per layer, so this cannot multiply
-            // candidates or disturb the ranking below.
-            + "LEFT JOIN layer_env le ON le.pk_layer = l.pk_layer AND le.str_key = ? "
             + "WHERE  j.str_state = 'PENDING' "
             + "  AND  j.b_paused  = false "
             // A host may advertise several OSes, comma-separated in
@@ -616,14 +584,6 @@ public class Maestro extends JdbcDaoSupport {
             // idx_layer_stat_waiting (V44). Replaces a correlated COUNT(*) + EXISTS
             // over frame that scanned every frame of each candidate layer per tick.
             + "  AND  COALESCE(ls.int_waiting_count, 0) > 0 "
-            // Skip layers whose limit (license cap) is already full farm-wide. Their
-            // frames get filtered out downstream by findNextDispatchFrames anyway, so
-            // scoring a host + running the plan read for them only burns a cycle that
-            // returns nothing (it surfaces as raceLost). A limit-less layer (NULL)
-            // always passes. Not a correctness gate, purely an efficiency
-            // filter: the downstream query still enforces the cap.
-            + "  AND (lim.pk_limit_record IS NULL "
-            + "       OR COALESCE(lu2.int_sum_running, 0) < lim.int_max_value) "
             // Skip jobs whose folder (group/dept) core ceiling is already reached
             // (folder_resource.int_max_cores, another core cap the legacy dispatcher
             // enforces; -1 = unlimited). Same rationale as the limit filter: purely an
@@ -693,17 +653,14 @@ public class Maestro extends JdbcDaoSupport {
                     c.waitingFrameCount = rs.getInt("waiting_frame_count");
                     c.clockTimeHighSec = rs.getInt("clock_time_high");
                     c.frameSuccessCount = rs.getInt("frame_success_count");
-                    c.limitId = rs.getString("limit_id"); // null when no limit
-                    c.limitMax = rs.getInt("limit_max");
-                    c.limitRunning = rs.getInt("limit_running");
                     c.folderId = rs.getString("folder_id");
                     c.folderMax = rs.getInt("folder_max"); // -1 = unlimited
                     c.folderRunning = rs.getInt("folder_running"); // core-points
-                    // Application licenses the layer declares, or null when none.
-                    // Kept null rather than an empty list so the placement loop
-                    // skips all license work with one reference check.
-                    List<String> lics = LicenseSource.splitNames(rs.getString("licenses"));
-                    c.licenses = lics.isEmpty() ? null : lics;
+                    // Limits bound to the layer, or null when none. Kept null
+                    // rather than an empty list so the placement loop skips all
+                    // limit work with one reference check.
+                    List<String> lims = splitIds(rs.getString("limit_ids"));
+                    c.limitIds = lims.isEmpty() ? null : lims;
                     return c;
                 }
             };
@@ -857,8 +814,8 @@ public class Maestro extends JdbcDaoSupport {
      * guardrail warns on); flow (committed procs, frames planned, the gap lost to the frame-version
      * race, RQD launches dropped); resv (reservations held and the cores they hold, newly granted,
      * requested last tick, and frames EASY-backfilled onto reserved hosts); and lic, only when
-     * licenses are in play (frames booked against a pool, candidates a pool held back, and planned
-     * frames trimmed at commit because a pool could not cover them).
+     * gating limits are in play (frames booked against a limit, candidates a limit held back, and
+     * planned frames trimmed at commit because a limit could not cover them).
      *
      * Called from runTick's finally on the thread that held tickInFlight, so the plain fields are
      * single-writer (summarySkipped is atomic, bumped by the CAS loser from another thread).
@@ -894,8 +851,8 @@ public class Maestro extends JdbcDaoSupport {
             reservedCp += r.layerCoresMin;
         }
 
-        // Licensing section, only when a license pool is actually in play, so the
-        // line stays as it was on the many farms that use no live licenses.
+        // Limit section, only when a gating limit is actually in play, so the
+        // line stays as it was on the many farms that use no limits.
         String lic = "";
         if (summaryLicenseBooked > 0 || summaryLicenseHeld > 0) {
             lic = String.format(" | lic booked=%d held=%d trimmed=%d", summaryLicenseBooked,
@@ -1033,67 +990,67 @@ public class Maestro extends JdbcDaoSupport {
     }
 
     /**
-     * Hold every live application-license pool to its availability. Same gap as the folder ceiling:
-     * the plan read is license-blind, so this trim is what actually holds the line. Floating pools
-     * count frames against budget.usable; host-based pools charge a seat only for hosts not already
-     * seated, and a frame's pools are spent only once it is certain to be kept (so a frame rejected
-     * by its second license never consumes a seat in its first). Dropped frames stay WAITING for
-     * the next tick. Returns the kept bookings.
+     * Hold every gating limit to its budget. Same gap as the folder ceiling: the plan read is
+     * limit-blind, so this trim is what actually holds the line. FRAME limits count frames against
+     * budget.usable; HOST limits charge a seat only for hosts not already seated, and a frame's
+     * limits are spent only once it is certain to be kept (so a frame rejected by its second limit
+     * never consumes a seat in its first). A limit with no budget entry does not gate (ADVISORY,
+     * DISABLED, or stale report). Dropped frames stay WAITING for the next tick. Returns the kept
+     * bookings.
      */
-    private List<FrameBooking> trimOverLicensePools(List<FrameBooking> planned,
-            Map<String, LicenseSource.LicenseBudget> licenseBudgets,
-            Map<String, List<String>> layerLicenses) {
-        if (licenseBudgets.isEmpty() || layerLicenses.isEmpty() || planned.isEmpty())
+    private List<FrameBooking> trimOverLimitBudgets(List<FrameBooking> planned,
+            Map<String, LimitBudget> limitBudgets, Map<String, List<String>> layerLimits) {
+        if (limitBudgets.isEmpty() || layerLimits.isEmpty() || planned.isEmpty())
             return planned;
-        Map<String, Integer> committedByLicense = new HashMap<>();
-        Map<String, Set<String>> seatsByLicense = new HashMap<>();
+        Map<String, Integer> committedByLimit = new HashMap<>();
+        Map<String, Set<String>> seatsByLimit = new HashMap<>();
         List<FrameBooking> keep = new ArrayList<>(planned.size());
-        int licTrimmed = 0;
+        int limTrimmed = 0;
         for (FrameBooking b : planned) {
-            List<String> names = layerLicenses.get(b.proc.getLayerId());
-            if (names == null) {
+            List<String> limIds = layerLimits.get(b.proc.getLayerId());
+            if (limIds == null) {
                 keep.add(b);
                 continue;
             }
-            String hostName = b.proc.hostName == null ? "" : b.proc.hostName.toLowerCase();
+            String hostName = shortHostName(b.proc.hostName);
             boolean fits = true;
-            for (String name : names) {
-                LicenseSource.LicenseBudget bd = licenseBudgets.get(name);
-                if (bd == null || bd.stale) {
-                    fits = false;
-                    break;
-                }
+            for (String limId : limIds) {
+                LimitBudget bd = limitBudgets.get(limId);
+                if (bd == null)
+                    continue;
                 if (bd.hostBased) {
                     Set<String> seats =
-                            seatsByLicense.computeIfAbsent(name, k -> new HashSet<>(bd.seats));
+                            seatsByLimit.computeIfAbsent(limId, k -> new HashSet<>(bd.seats));
                     if (!seats.contains(hostName) && seats.size() >= bd.seatCap) {
                         fits = false;
                         break;
                     }
-                } else if (committedByLicense.getOrDefault(name, 0) + 1 > bd.usable) {
+                } else if (committedByLimit.getOrDefault(limId, 0) + 1 > bd.usable) {
                     fits = false;
                     break;
                 }
             }
             if (!fits) {
-                licTrimmed++;
+                limTrimmed++;
                 continue;
             }
-            for (String name : names) {
-                LicenseSource.LicenseBudget bd = licenseBudgets.get(name);
+            for (String limId : limIds) {
+                LimitBudget bd = limitBudgets.get(limId);
+                if (bd == null)
+                    continue;
                 if (bd.hostBased) {
-                    seatsByLicense.get(name).add(hostName);
+                    seatsByLimit.get(limId).add(hostName);
                 } else {
-                    committedByLicense.merge(name, 1, Integer::sum);
+                    committedByLimit.merge(limId, 1, Integer::sum);
                 }
             }
             keep.add(b);
         }
-        if (licTrimmed == 0)
+        if (limTrimmed == 0)
             return planned;
-        tickLicenseTrimmed += licTrimmed;
-        logger.debug("Maestro: license pools trimmed " + licTrimmed
-                + " planned frame(s) over live availability this tick");
+        tickLicenseTrimmed += limTrimmed;
+        logger.debug("Maestro: limit budgets trimmed " + limTrimmed
+                + " planned frame(s) over availability this tick");
         return keep;
     }
 
@@ -1193,15 +1150,15 @@ public class Maestro extends JdbcDaoSupport {
         placedLayerIds.clear();
         jobCoresUsed.clear();
         showCoresUsed.clear();
-        limitUsed.clear();
         folderUsed.clear();
         folderMaxCp.clear();
         folderRunSeed.clear();
         jobFolderCap.clear();
-        layerLicenses.clear();
-        licenseBudgets.clear();
-        licenseUsed.clear();
-        licenseSeats.clear();
+        layerLimits.clear();
+        limitBudgets.clear();
+        limitUsed.clear();
+        limitSeats.clear();
+        limitBudgetsResolved = false;
         seenLayerIds.clear();
         reservationReqs.clear();
         waitReasonByLayer.clear();
@@ -1261,10 +1218,10 @@ public class Maestro extends JdbcDaoSupport {
                 jobFolderCap.putIfAbsent(lc.jobId, lc.folderId);
             }
         }
-        resolveLicenseBudgets(candidates, layerLicenses, licenseBudgets);
+        resolveLimitBudgets(candidates, layerLimits, limitBudgets);
         int booked = dispatchGroupWithScoring(idleGroup, fullGroup, candidates, seenLayerIds,
-                spec.pkAlloc, jobCoresUsed, showCoresUsed, limitUsed, folderUsed, reservationReqs,
-                tReadyByHost, hostLayerAffinity, licenseBudgets, licenseUsed, licenseSeats);
+                spec.pkAlloc, jobCoresUsed, showCoresUsed, folderUsed, reservationReqs,
+                tReadyByHost, hostLayerAffinity, limitBudgets, limitUsed, limitSeats);
         stats.strandedCores += strandedWholeCores(fullGroup, candidates);
         if (booked > 0)
             stats.booked++;
@@ -1361,13 +1318,13 @@ public class Maestro extends JdbcDaoSupport {
 
         grantReservations(reservationReqs);
 
-        // 4. PLAN bookings in parallel, then trim to the exact folder + license limits.
+        // 4. PLAN bookings in parallel, then trim to the exact folder + limit budgets.
         long tPlan = System.currentTimeMillis();
         List<FrameBooking> planned = planBookings();
         if (planned == null)
             return dispatched; // interrupted mid-plan; abort before committing
         planned = trimOverFolderCeiling(planned, folderMaxCp, folderRunSeed, jobFolderCap);
-        planned = trimOverLicensePools(planned, licenseBudgets, layerLicenses);
+        planned = trimOverLimitBudgets(planned, limitBudgets, layerLimits);
         long tRead = System.currentTimeMillis();
         tickPlanned = planned.size();
 
@@ -1719,9 +1676,6 @@ public class Maestro extends JdbcDaoSupport {
      */
     public void onShutdown() {
         closeLeaderConn();
-        LicenseSource ls = licenseSource;
-        if (ls != null)
-            ls.stop();
     }
 
     private boolean acquireLeaderLock(Connection conn) throws SQLException {
@@ -1832,7 +1786,7 @@ public class Maestro extends JdbcDaoSupport {
      * eligibility rule in one visible line instead of hand-written SQL against a live incident. The
      * subscription join is LEFT here (unlike the real query) precisely so a missing subscription
      * shows up as hasSub=false instead of an invisible row; each column mirrors its production
-     * clause (os = ANY of the host's comma-separated list, facility bind, smallest-cap limit).
+     * clause (os = ANY of the host's comma-separated list, facility bind).
      */
     // spotless:off
     private static final String EXPLAIN_GROUP_EXCLUSIONS =
@@ -1851,14 +1805,8 @@ public class Maestro extends JdbcDaoSupport {
             + "  (jr.int_cores < jr.int_max_cores)                    AS under_job_cap, "
             + "  (l.int_cores_min <= ?)                               AS fits_cores, "
             + "  (COALESCE(ls.int_waiting_count, 0) > 0)              AS has_waiting, "
-            + "  (NOT EXISTS ("
-            + "     SELECT 1 FROM layer_limit ll "
-            + "     JOIN limit_record lr ON lr.pk_limit_record = ll.pk_limit_record "
-            + "     WHERE ll.pk_layer = l.pk_layer "
-            + "       AND (SELECT COALESCE(SUM(ls2.int_running_count), 0) FROM layer_limit ll2 "
-            + "            JOIN layer_stat ls2 ON ls2.pk_layer = ll2.pk_layer "
-            + "            WHERE ll2.pk_limit_record = lr.pk_limit_record) >= lr.int_max_value)) "
-            + "                                                       AS limit_ok, "
+            // No limit column: limits no longer exclude at query level; the
+            // in-memory gate names them in the why-not trace instead.
             + "  (COALESCE(fr.int_max_cores, -1) = -1 "
             + "   OR (SELECT COALESCE(SUM(ls3.int_running_count * l3.int_cores_min), 0) "
             + "       FROM job j3 JOIN layer l3 ON l3.pk_job = j3.pk_job "
@@ -1889,66 +1837,163 @@ public class Maestro extends JdbcDaoSupport {
                     + rs.getBoolean("thread_ok") + " hasSub=" + rs.getBoolean("has_sub")
                     + " underBurst=" + rs.getBoolean("under_burst") + " underJobCap="
                     + rs.getBoolean("under_job_cap") + " fitsCores=" + rs.getBoolean("fits_cores")
-                    + " hasWaiting=" + rs.getBoolean("has_waiting") + " limitOk="
-                    + rs.getBoolean("limit_ok") + " folderOk=" + rs.getBoolean("folder_ok")
-                    + " managedOk=" + rs.getBoolean("managed_ok"));
+                    + " hasWaiting=" + rs.getBoolean("has_waiting") + " folderOk="
+                    + rs.getBoolean("folder_ok") + " managedOk=" + rs.getBoolean("managed_ok"));
         }, spec.tagsNormalized, spec.os, spec.pkFacility, spec.allThreadMode ? 1 : 0,
                 maxCoresTotalInGroup, MaestroMode.facility(env), spec.pkAlloc);
     }
 
     /**
-     * Record which of these candidates need application licenses, and make sure a budget exists for
-     * every pool they name.
+     * What Maestro may book against one gating limit this tick.
      *
-     * The license names already arrived on the candidate rows (the candidate query carries them),
-     * so this costs nothing but a walk of the list. Budgets are the part that touches the database
-     * (the in-flight term), so they are derived once per license per tick: a pool named by an
-     * earlier group is reused by every later one, which also keeps the numbers consistent across
-     * groups within a tick. Both maps are tick-scoped and Maestro-thread only.
+     * For a FRAME limit only {@link #usable} matters: frames still bookable right now. For a HOST
+     * limit the cap counts distinct machines, so Maestro needs the holder set ({@link #seats}:
+     * hosts already holding the limit, external holders included) and {@link #seatCap}, the most
+     * machines it may let hold it.
      */
-    private void resolveLicenseBudgets(List<LayerCandidate> candidates,
-            Map<String, List<String>> layerLicenses,
-            Map<String, LicenseSource.LicenseBudget> licenseBudgets) {
-        Set<String> fresh = null;
-        for (LayerCandidate c : candidates) {
-            if (c.licenses == null)
-                continue;
-            layerLicenses.put(c.layerId, c.licenses);
-            for (String name : c.licenses) {
-                if (!licenseBudgets.containsKey(name)) {
-                    if (fresh == null)
-                        fresh = new HashSet<>();
-                    fresh.add(name);
-                }
-            }
+    static final class LimitBudget {
+        final String id;
+        final String name;
+        final boolean hostBased;
+        final int usable;
+        final int seatCap;
+        final Set<String> seats;
+
+        LimitBudget(String id, String name, boolean hostBased, int usable, int seatCap,
+                Set<String> seats) {
+            this.id = id;
+            this.name = name;
+            this.hostBased = hostBased;
+            this.usable = usable;
+            this.seatCap = seatCap;
+            this.seats = seats;
         }
-        if (fresh == null)
-            return;
-        LicenseSource ls = licenseSource;
-        if (ls == null) {
-            // No source at all (a tick before init). Hold rather than run blind.
-            for (String name : fresh) {
-                licenseBudgets.put(name, new LicenseSource.LicenseBudget(name, false, 0, 0,
-                        Collections.emptySet(), true));
-            }
-            return;
+    }
+
+    // Per-limit budget rows for a tick: every limit the legacy dispatcher's gate would apply
+    // (ENFORCED and, when externally reported, fresh), with its thresholds and merged usage.
+    // Reuses the gate's own CTE so the two dispatchers count identically.
+    private static final String SELECT_LIMIT_BUDGETS = DispatchQuery.LIMIT_USAGE_CTE
+            + "SELECT lim.pk_limit_record, lr.str_name, lim.str_type, lim.int_soft_value, "
+            + "lim.int_max_value, lim.usage_val "
+            + "FROM lim JOIN limit_record lr ON lr.pk_limit_record = lim.pk_limit_record";
+
+    // Hosts holding a HOST-type limit: the license server's reported holders union every host of
+    // ours running a frame of a bound layer (the same generous test as DispatchQuery.hostHolds,
+    // precomputed once per tick instead of per candidate row).
+    private static final String SELECT_LIMIT_HOLDERS =
+            "SELECT hld.pk_limit_record AS id, hld.str_host_name AS host " + "FROM limit_host hld "
+                    + "JOIN limit_record lr ON lr.pk_limit_record = hld.pk_limit_record "
+                    + "WHERE lr.str_type = 'HOST' " + "UNION "
+                    + "SELECT ll.pk_limit_record, SPLIT_PART(LOWER(h.str_name), '.', 1) "
+                    + "FROM proc p " + "JOIN host h ON h.pk_host = p.pk_host "
+                    + "JOIN layer_limit ll ON ll.pk_layer = p.pk_layer "
+                    + "JOIN limit_record lr2 ON lr2.pk_limit_record = ll.pk_limit_record "
+                    + "WHERE lr2.str_type = 'HOST'";
+
+    /**
+     * SELECT_LIMIT_BUDGETS with the limit gate's placeholder tokens resolved. Lazy because the
+     * MATERIALIZED keyword depends on the server version, which needs a live connection.
+     */
+    private volatile String limitBudgetsSql;
+
+    private String limitBudgetsSql() {
+        String sql = limitBudgetsSql;
+        if (sql == null) {
+            Integer version =
+                    getJdbcTemplate().queryForObject("SHOW server_version_num", Integer.class);
+            sql = SELECT_LIMIT_BUDGETS
+                    .replace(DispatchQuery.SETTLE_WINDOW_TOKEN,
+                            String.valueOf(env.getProperty("limit.settle_window_seconds",
+                                    Integer.class, 120)))
+                    .replace(DispatchQuery.CTE_MATERIALIZED_TOKEN,
+                            (version != null && version >= 120000) ? "MATERIALIZED" : "");
+            limitBudgetsSql = sql;
         }
-        licenseBudgets.putAll(ls.snapshotBudgets(fresh));
+        return sql;
     }
 
     /**
-     * May this host take a frame of a layer whose licenses include host-based pools?
+     * Record which of these candidates are bound to limits, and load this tick's budgets on first
+     * need.
      *
-     * Yes when, for every such pool, the host either already holds a seat (extra frames there are
-     * free, they share the one checkout) or the pool still has an unused seat. The seat set
-     * includes seats the license server reports held by machines outside the cue, so an artist's
-     * workstation occupies a seat here just as a render node does.
+     * The bound limit ids already arrived on the candidate rows, so recording them costs nothing
+     * but a walk of the list. Budgets are the part that touches the database, so they are read once
+     * per tick, the first time any candidate is bound: one query for every gating limit's merged
+     * usage (the legacy gate's own counting rule) and, when HOST limits exist, one for their holder
+     * sets. Later groups reuse them, which also keeps the numbers consistent across groups within a
+     * tick. All the maps are tick-scoped and Maestro-thread only.
+     *
+     * Mirroring {@code DispatchQuery.limitFilter}, a limit that is ADVISORY or DISABLED, or whose
+     * external report has gone stale past its TTL, gets no budget entry at all: candidates book
+     * through it exactly as they would under the legacy dispatcher.
      */
-    private static boolean licenseSeatsAllow(List<LicenseSource.LicenseBudget> pools,
-            Map<String, Set<String>> licenseSeats, BookableHost h) {
-        String hostName = h.hostName.toLowerCase();
-        for (LicenseSource.LicenseBudget b : pools) {
-            Set<String> seats = licenseSeats.get(b.name);
+    /* package for tests */ void resolveLimitBudgets(List<LayerCandidate> candidates,
+            Map<String, List<String>> layerLimits, Map<String, LimitBudget> limitBudgets) {
+        boolean bound = false;
+        for (LayerCandidate c : candidates) {
+            if (c.limitIds == null)
+                continue;
+            layerLimits.put(c.layerId, c.limitIds);
+            bound = true;
+        }
+        if (!bound || limitBudgetsResolved)
+            return;
+        limitBudgetsResolved = true;
+
+        List<Object[]> rows = getJdbcTemplate().query(limitBudgetsSql(),
+                (rs, i) -> new Object[] {rs.getString("pk_limit_record"), rs.getString("str_name"),
+                        rs.getString("str_type"), rs.getInt("int_soft_value"),
+                        rs.getInt("int_max_value"), rs.getInt("usage_val")});
+        Map<String, Set<String>> holders = null;
+        for (Object[] row : rows) {
+            String id = (String) row[0];
+            String name = (String) row[1];
+            boolean hostBased = "HOST".equals(row[2]);
+            int soft = (Integer) row[3];
+            int max = (Integer) row[4];
+            int usage = (Integer) row[5];
+            if (hostBased) {
+                if (holders == null)
+                    holders = readLimitHolders();
+                Set<String> seats = holders.getOrDefault(id, new HashSet<>());
+                // Above the threshold (soft when set, max otherwise) only holding
+                // machines may book; below it, threshold - usage new machines may
+                // light up. Expressed as a seat cap over the live seat set so the
+                // spend during the tick is what closes the gap.
+                int threshold = soft >= 0 ? soft : max;
+                int seatCap = seats.size() + Math.max(0, threshold - usage);
+                limitBudgets.put(id, new LimitBudget(id, name, true, 0, seatCap, seats));
+            } else {
+                limitBudgets.put(id, new LimitBudget(id, name, false, Math.max(0, max - usage), 0,
+                        Collections.emptySet()));
+            }
+        }
+    }
+
+    /** Holder host sets per HOST-type limit, keyed by limit id. Sets are tick-mutable. */
+    private Map<String, Set<String>> readLimitHolders() {
+        Map<String, Set<String>> holders = new HashMap<>();
+        getJdbcTemplate().query(SELECT_LIMIT_HOLDERS, rs -> {
+            holders.computeIfAbsent(rs.getString("id"), k -> new HashSet<>())
+                    .add(rs.getString("host"));
+        });
+        return holders;
+    }
+
+    /**
+     * May this host take a frame of a layer bound to HOST-type limits?
+     *
+     * Yes when, for every such limit, the host either already holds it (extra frames there are
+     * free, they share the one checkout) or the limit still has a seat to give out. The seat set
+     * includes holders the license server reports outside the cue, so an artist's workstation
+     * occupies a seat here just as a render node does.
+     */
+    /* package for tests */ static boolean limitSeatsAllow(List<LimitBudget> pools,
+            Map<String, Set<String>> limitSeats, BookableHost h) {
+        String hostName = shortHostName(h.hostName);
+        for (LimitBudget b : pools) {
+            Set<String> seats = limitSeats.get(b.id);
             if (seats.contains(hostName))
                 continue;
             if (seats.size() >= b.seatCap)
@@ -1957,18 +2002,37 @@ public class Maestro extends JdbcDaoSupport {
         return true;
     }
 
+    /** The normalized seat key: short hostname, lowercased, as limit_host stores it. */
+    private static String shortHostName(String hostName) {
+        if (hostName == null)
+            return "";
+        String lower = hostName.toLowerCase();
+        int dot = lower.indexOf('.');
+        return dot < 0 ? lower : lower.substring(0, dot);
+    }
+
+    /** {@code "a,b"} to {@code [a, b]}, blanks dropped. */
+    static List<String> splitIds(String csv) {
+        List<String> out = new ArrayList<>(2);
+        if (csv == null)
+            return out;
+        for (String part : csv.split(",")) {
+            String s = part.trim();
+            if (!s.isEmpty() && !out.contains(s))
+                out.add(s);
+        }
+        return out;
+    }
+
     /* package for tests */ List<LayerCandidate> readLayerCandidatesForGroup(HostSpecKey spec,
             int maxIdleInGroup) {
         int limit = env.getProperty("maestro.layer_candidates_per_group_max", Integer.class, 2000);
-        LicenseSource ls = licenseSource;
-        String licenseKey = (ls != null) ? ls.getEnvKey() : "CUE_LICENSES";
         List<LayerCandidate> rows =
                 getJdbcTemplate().query(SELECT_CANDIDATES_FOR_GROUP, CANDIDATE_MAPPER, spec.pkAlloc,
-                        licenseKey, spec.os, spec.pkFacility, spec.allThreadMode ? 1 : 0,
-                        spec.tagsNormalized, maxIdleInGroup, MaestroMode.facility(env), limit);
-        // Defensive dedupe: nothing in the schema forbids two layer_env rows
-        // with the same key, and a duplicated row would clone its candidate
-        // (double placement per tick). First row per layer wins.
+                        spec.os, spec.pkFacility, spec.allThreadMode ? 1 : 0, spec.tagsNormalized,
+                        maxIdleInGroup, MaestroMode.facility(env), limit);
+        // Defensive dedupe: a duplicated row would clone its candidate (double
+        // placement per tick). First row per layer wins.
         Set<String> seen = new HashSet<>(rows.size() * 2);
         List<LayerCandidate> out = new ArrayList<>(rows.size());
         for (LayerCandidate c : rows) {
@@ -2122,11 +2186,10 @@ public class Maestro extends JdbcDaoSupport {
     private int dispatchGroupWithScoring(List<BookableHost> hosts, List<BookableHost> fullHosts,
             List<LayerCandidate> candidates, Set<String> seenLayerIds, String groupAllocId,
             Map<String, Integer> jobCoresUsed, Map<String, Integer> showCoresUsed,
-            Map<String, Integer> limitUsed, Map<String, Integer> folderUsed,
-            List<ReservationRequest> reservationReqs, Map<String, Integer> tReadyByHost,
-            Map<String, Set<String>> hostLayerAffinity,
-            Map<String, LicenseSource.LicenseBudget> licenseBudgets,
-            Map<String, Integer> licenseUsed, Map<String, Set<String>> licenseSeats) {
+            Map<String, Integer> folderUsed, List<ReservationRequest> reservationReqs,
+            Map<String, Integer> tReadyByHost, Map<String, Set<String>> hostLayerAffinity,
+            Map<String, LimitBudget> limitBudgets, Map<String, Integer> limitUsed,
+            Map<String, Set<String>> limitSeats) {
         int dispatched = 0;
         // Largest host in this group, for the reservation width gate below: a
         // layer may reserve only if its per-frame cores are a big enough fraction
@@ -2159,37 +2222,27 @@ public class Maestro extends JdbcDaoSupport {
             // two bursts, and the candidate row carries this group's own sub.int_cores.
             c.showCoresInUse = showCoresUsed.computeIfAbsent(subKey(c.showId, groupAllocId),
                     k -> c.showCoresInUse);
-            // Seed this limit's tick-wide running count from the farm-wide count
-            // the first time it is seen this tick (candidate query already
-            // excluded limits that were full at query time; this catches a limit
-            // filling during the tick as sibling layers book against it).
-            int limitInUse =
-                    (c.limitId != null) ? limitUsed.computeIfAbsent(c.limitId, k -> c.limitRunning)
-                            : 0;
-
-            // Live application licenses: a layer needs a seat in every pool it
-            // declares. Floating pools allow the minimum of their remaining counts;
-            // host-based pools are enforced per host in the scoring loop. A
-            // stale or unreported pool holds the layer, never runs it blind.
-            int licenseUsable = Integer.MAX_VALUE;
-            boolean licenseHeld = false;
-            List<LicenseSource.LicenseBudget> licenseSeatPools = null;
-            if (c.licenses != null) {
-                for (String licName : c.licenses) {
-                    LicenseSource.LicenseBudget b = licenseBudgets.get(licName);
-                    if (b == null || b.stale) {
-                        licenseHeld = true;
-                        break;
-                    }
+            // Limits the layer is bound to: FRAME limits allow the minimum of their
+            // remaining budgets, tick-wide; HOST limits are enforced per host in the
+            // scoring loop. A limit with no budget entry does not gate (ADVISORY,
+            // DISABLED, or its external report went stale), exactly as under the
+            // legacy dispatcher's gate.
+            int limitUsable = Integer.MAX_VALUE;
+            List<LimitBudget> limitSeatPools = null;
+            if (c.limitIds != null) {
+                for (String limId : c.limitIds) {
+                    LimitBudget b = limitBudgets.get(limId);
+                    if (b == null)
+                        continue;
                     if (b.hostBased) {
-                        if (licenseSeatPools == null)
-                            licenseSeatPools = new ArrayList<>(2);
-                        licenseSeatPools.add(b);
-                        licenseSeats.computeIfAbsent(licName, k -> new HashSet<>(b.seats));
+                        if (limitSeatPools == null)
+                            limitSeatPools = new ArrayList<>(2);
+                        limitSeatPools.add(b);
+                        limitSeats.putIfAbsent(limId, b.seats);
                     } else {
-                        int remaining = b.usable - licenseUsed.computeIfAbsent(licName, k -> 0);
-                        if (remaining < licenseUsable)
-                            licenseUsable = remaining;
+                        int remaining = b.usable - limitUsed.computeIfAbsent(limId, k -> 0);
+                        if (remaining < limitUsable)
+                            limitUsable = remaining;
                     }
                 }
             }
@@ -2204,10 +2257,9 @@ public class Maestro extends JdbcDaoSupport {
             // can no longer use so other work can take those hosts.
             boolean capped = c.jobCoresInUse + c.layerCoresMin > c.jobMaxCores
                     || c.showCoresInUse + c.layerCoresMin > c.showBurstCores
-                    || (c.limitId != null && limitInUse >= c.limitMax)
                     || (c.folderMax >= 0 && folderInUse + c.layerCoresMin > c.folderMax)
-                    || licenseHeld || licenseUsable <= 0;
-            if (c.licenses != null && (licenseHeld || licenseUsable <= 0))
+                    || limitUsable <= 0;
+            if (c.limitIds != null && limitUsable <= 0)
                 tickLicenseHeld++;
 
             boolean placed = false;
@@ -2229,13 +2281,11 @@ public class Maestro extends JdbcDaoSupport {
                 for (BookableHost h : hosts) {
                     if (!fitsOnHost(c, h))
                         continue;
-                    // Same gate for a host-based license pool, but keyed by host
-                    // name (what a license server reports) and against the live
-                    // seat count rather than a typed-in cap: this host is
-                    // eligible only if it already holds a seat in every such
-                    // pool, or the pool still has a seat to give out.
-                    if (licenseSeatPools != null
-                            && !licenseSeatsAllow(licenseSeatPools, licenseSeats, h))
+                    // Per-host gate for HOST-type limits, keyed by host name (what
+                    // a license server reports): this host is eligible only if it
+                    // already holds every such limit, or the limit still has a
+                    // seat to give out.
+                    if (limitSeatPools != null && !limitSeatsAllow(limitSeatPools, limitSeats, h))
                         continue;
                     // A reserved host is off-limits unless EASY backfill can
                     // borrow it without delaying the reservation's owner.
@@ -2286,16 +2336,16 @@ public class Maestro extends JdbcDaoSupport {
                             }
                         }
                     }
-                    // Seat bonus for host-based license pools: packing onto an
+                    // Seat bonus for HOST-type limits: packing onto an
                     // already-seated machine consumes no new seat, which is the
                     // whole point when seats are the scarce resource. Applied per
-                    // pool, so a host seated in all of the layer's pools outranks
+                    // limit, so a host seated in all of the layer's limits outranks
                     // one seated in only some. Stacks with the locality bonus.
-                    if (licenseSeatPools != null) {
-                        String hName = h.hostName.toLowerCase();
-                        for (LicenseSource.LicenseBudget b : licenseSeatPools) {
-                            if (licenseSeats.get(b.name).contains(hName))
-                                score -= licenseSeatBonus;
+                    if (limitSeatPools != null) {
+                        String hName = shortHostName(h.hostName);
+                        for (LimitBudget b : limitSeatPools) {
+                            if (limitSeats.get(b.id).contains(hName))
+                                score -= limitSeatBonus;
                         }
                     }
                     if (score < bestScore) {
@@ -2316,8 +2366,8 @@ public class Maestro extends JdbcDaoSupport {
                 // Estimate how many frames this commit will book. The
                 // dispatcher books up to job_frame_dispatch_max per call,
                 // bounded by the same fit checks placementScore uses.
-                int estFrames = headroomFrames(c, best, overCap, probeHeadroom, limitUsed,
-                        licenseUsable, folderUsed);
+                int estFrames =
+                        headroomFrames(c, best, overCap, probeHeadroom, limitUsable, folderUsed);
                 if (estFrames <= 0)
                     break;
 
@@ -2346,33 +2396,34 @@ public class Maestro extends JdbcDaoSupport {
                     hostLayerFrames.merge(best.hostId + "|" + c.layerId, estFrames, Integer::sum);
                 if (!c.rssProven)
                     layerProbeUsed.merge(c.layerId, estFrames, Integer::sum);
-                if (c.limitId != null)
-                    limitUsed.merge(c.limitId, estFrames, Integer::sum);
                 if (c.folderMax >= 0)
                     folderUsed.merge(c.folderId, estCores, Integer::sum);
-                // Spend the licenses: a frame is a seat in each floating pool, and
-                // this host now holds a seat in each host-based one. Both are
-                // tick-wide so every later candidate of the same pool, in any
-                // group, sees the spend.
-                if (c.licenses != null) {
-                    if (licenseUsable != Integer.MAX_VALUE)
-                        licenseUsable -= estFrames;
-                    for (String licName : c.licenses) {
-                        LicenseSource.LicenseBudget b = licenseBudgets.get(licName);
+                // Spend the limits: a frame is a token in each FRAME limit, and
+                // this host now holds a seat in each HOST one. Both are tick-wide
+                // so every later candidate of the same limit, in any group, sees
+                // the spend.
+                if (c.limitIds != null) {
+                    boolean gated = false;
+                    if (limitUsable != Integer.MAX_VALUE)
+                        limitUsable -= estFrames;
+                    for (String limId : c.limitIds) {
+                        LimitBudget b = limitBudgets.get(limId);
                         if (b == null)
                             continue;
+                        gated = true;
                         if (b.hostBased) {
-                            Set<String> seats = licenseSeats.get(licName);
-                            if (seats.add(best.hostName.toLowerCase())) {
-                                logger.info("Maestro license: new seat " + seats.size() + "/"
-                                        + b.seatCap + " on host " + best.hostName + " for license "
-                                        + licName);
+                            Set<String> seats = limitSeats.get(limId);
+                            if (seats.add(shortHostName(best.hostName))) {
+                                logger.info("Maestro limit: new seat " + seats.size() + "/"
+                                        + b.seatCap + " on host " + best.hostName + " for limit "
+                                        + b.name);
                             }
                         } else {
-                            licenseUsed.merge(licName, estFrames, Integer::sum);
+                            limitUsed.merge(limId, estFrames, Integer::sum);
                         }
                     }
-                    tickLicenseBooked += estFrames;
+                    if (gated)
+                        tickLicenseBooked += estFrames;
                 }
 
                 // Count an EASY-backfill borrow for the stat line: this host
@@ -2410,16 +2461,12 @@ public class Maestro extends JdbcDaoSupport {
                     why = "jobMaxCores";
                 else if (c.showCoresInUse + c.layerCoresMin > c.showBurstCores)
                     why = "showBurst";
-                else if (c.limitId != null && limitInUse >= c.limitMax)
-                    why = "limitFull(" + limitInUse + "/" + c.limitMax + ")";
                 else if (c.folderMax >= 0 && folderInUse + c.layerCoresMin > c.folderMax)
                     why = "folderCap(" + folderInUse + "/" + c.folderMax + ")";
-                else if (licenseHeld)
-                    why = "licenseHeld(stale or unreported pool: " + c.licenses + ")";
-                else if (licenseUsable <= 0)
-                    why = "licenseNoFloatingSeats(" + c.licenses + ")";
-                else if (licenseSeatPools != null)
-                    why = "noFittingIdleHost(seat-gated pools present)";
+                else if (limitUsable <= 0)
+                    why = "limitFull(" + c.limitIds + ")";
+                else if (limitSeatPools != null)
+                    why = "noFittingIdleHost(seat-gated limits present)";
                 else
                     why = "noFittingIdleHost";
                 logger.debug("Maestro unplaced: layer=" + c.layerId + " prio=" + c.priority
@@ -2435,8 +2482,8 @@ public class Maestro extends JdbcDaoSupport {
             if (c.waitingFrameCount > 0) {
                 waitReasonByLayer.put(c.layerId,
                         placed ? "flowing"
-                                : waitlistReason(c, hosts, limitInUse, folderInUse, licenseHeld,
-                                        licenseUsable, licenseSeatPools, licenseSeats));
+                                : waitlistReason(c, hosts, folderInUse, limitUsable, limitSeatPools,
+                                        limitSeats));
                 waitFramesByLayer.put(c.layerId, c.waitingFrameCount);
             } else if (placed) {
                 waitReasonByLayer.remove(c.layerId);
@@ -2782,8 +2829,7 @@ public class Maestro extends JdbcDaoSupport {
      * (overCap) skips the per-host layer-cap term; the cap already yielded for this booking.
      */
     private int headroomFrames(LayerCandidate c, BookableHost best, boolean overCap,
-            int probeHeadroom, Map<String, Integer> limitUsed, int licenseUsable,
-            Map<String, Integer> folderUsed) {
+            int probeHeadroom, int limitUsable, Map<String, Integer> folderUsed) {
         long maxMore = computeMaxMore(best, c);
         // Commit size: one plan slice.
         int est = (int) Math.min(frameQueryMax, maxMore + 1);
@@ -2791,12 +2837,9 @@ public class Maestro extends JdbcDaoSupport {
         est = Math.min(est, c.waitingFrameCount);
         // Probe: an unproven layer's remaining farm-wide allowance.
         est = Math.min(est, probeHeadroom);
-        // Named limit: the tick-wide running count is authoritative.
-        if (c.limitId != null)
-            est = Math.min(est, c.limitMax - limitUsed.get(c.limitId));
-        // Licenses: one frame is one seat, floating pools shared tick-wide.
-        if (licenseUsable != Integer.MAX_VALUE)
-            est = Math.min(est, licenseUsable);
+        // FRAME limits: one frame is one token, budgets shared tick-wide.
+        if (limitUsable != Integer.MAX_VALUE)
+            est = Math.min(est, limitUsable);
         // Folder ceiling (cores, not frames).
         if (c.folderMax >= 0 && c.layerCoresMin > 0)
             est = Math.min(est, (c.folderMax - folderUsed.get(c.folderId)) / c.layerCoresMin);
@@ -3108,15 +3151,14 @@ public class Maestro extends JdbcDaoSupport {
 
     /**
      * Resolve a {@code fit} fragmentation (some host fit the layer fully, yet it did not book) into
-     * the gate that held it: {@code license} when a fitting host's host-based seat is taken, else
+     * the gate that held it: {@code license} when a fitting host's HOST-limit seat is taken, else
      * {@code held} (a reservation is draining that host for a wide job).
      */
     private String fitGateReason(LayerCandidate c, List<BookableHost> hosts,
-            List<LicenseSource.LicenseBudget> licenseSeatPools,
-            Map<String, Set<String>> licenseSeats) {
-        if (licenseSeatPools != null) {
+            List<LimitBudget> limitSeatPools, Map<String, Set<String>> limitSeats) {
+        if (limitSeatPools != null) {
             for (BookableHost h : hosts) {
-                if (fitsOnHost(c, h) && !licenseSeatsAllow(licenseSeatPools, licenseSeats, h))
+                if (fitsOnHost(c, h) && !limitSeatsAllow(limitSeatPools, limitSeats, h))
                     return "license";
             }
         }
@@ -3125,27 +3167,25 @@ public class Maestro extends JdbcDaoSupport {
 
     /**
      * The waitlist bucket for an unplaced candidate that still has waiting frames, by the same
-     * precedence as the why-not trace: a job / show / limit / folder cap is {@code limit}; an
-     * exhausted or stale license pool is {@code no license}; a fitting host reserved for someone
-     * else is {@code held}. The remaining fit failures split in two: {@code capacity} when the
-     * group's idle cores together cannot cover even one frame (the farm is simply full, nothing is
-     * wrong), and {@code no fit} when idle cores exist but none fits (slivers too small for a wide
-     * frame, or memory / gpu short): the shape mismatch worth investigating.
+     * precedence as the why-not trace: a job / show / folder cap is {@code limit}; an exhausted
+     * FRAME-limit budget is {@code no license}; a fitting host reserved for someone else is
+     * {@code held}. The remaining fit failures split in two: {@code capacity} when the group's idle
+     * cores together cannot cover even one frame (the farm is simply full, nothing is wrong), and
+     * {@code no fit} when idle cores exist but none fits (slivers too small for a wide frame, or
+     * memory / gpu short): the shape mismatch worth investigating.
      */
-    private String waitlistReason(LayerCandidate c, List<BookableHost> hosts, int limitInUse,
-            int folderInUse, boolean licenseHeld, int licenseUsable,
-            List<LicenseSource.LicenseBudget> licenseSeatPools,
-            Map<String, Set<String>> licenseSeats) {
+    private String waitlistReason(LayerCandidate c, List<BookableHost> hosts, int folderInUse,
+            int limitUsable, List<LimitBudget> limitSeatPools,
+            Map<String, Set<String>> limitSeats) {
         if (c.jobCoresInUse + c.layerCoresMin > c.jobMaxCores
                 || c.showCoresInUse + c.layerCoresMin > c.showBurstCores
-                || (c.limitId != null && limitInUse >= c.limitMax)
                 || (c.folderMax >= 0 && folderInUse + c.layerCoresMin > c.folderMax))
             return "limit";
-        if (licenseHeld || licenseUsable <= 0)
+        if (limitUsable <= 0)
             return "no license";
         String fit = classifyFragmentation(c, hosts);
         if ("fit".equals(fit))
-            fit = fitGateReason(c, hosts, licenseSeatPools, licenseSeats);
+            fit = fitGateReason(c, hosts, limitSeatPools, limitSeats);
         if ("held".equals(fit))
             return "held";
         if ("license".equals(fit))
@@ -3247,17 +3287,10 @@ public class Maestro extends JdbcDaoSupport {
         // backfills onto (see backfillAllows).
         int clockTimeHighSec;
         int frameSuccessCount;
-        // Limit (license-cap) accounting. limitId is the layer's most-constraining
-        // limit (null = no limit); limitMax is that limit's int_max_value;
-        // limitRunning is how many frames of it run farm-wide right now (seed for
-        // the tick-wide limitUsed cap in dispatchGroupWithScoring).
-        String limitId;
-        int limitMax;
-        int limitRunning;
-        // Live application licenses the layer declares in CUE_LICENSES, or null
-        // when it declares none (the common case). A seat is needed in every pool
-        // listed. Carried on the candidate row via the layer_env join, not a second read.
-        List<String> licenses;
+        // Limits bound to the layer (layer_limit rows), or null when none (the
+        // common case). Which of them actually gate, and with what budget, is
+        // resolved once per tick in resolveLimitBudgets.
+        List<String> limitIds;
         // Folder (group/dept) core cap. folderId is the job's folder; folderMax is
         // folder_resource.int_max_cores (-1 = unlimited, core-points); folderRunning
         // is the folder's current running cores (core-points), seed for the

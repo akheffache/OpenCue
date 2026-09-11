@@ -345,58 +345,41 @@ handed out in priority-weighted lottery order too (`sortByPriorityLottery`;
 starved by a higher-priority stream. Reservations are firm, so a lottery win is
 never clawed back.
 
-### 3.6 Live application licenses
+### 3.6 Limit-gated placement (application licenses)
 
-A layer that needs a floating application license (Houdini Engine, Katana,
-Maya, ...) declares it in its own environment:
+Maestro gates placement on the same **limits** the legacy dispatcher enforces
+(`limit_record` / `layer_limit` / `limit_usage` / `limit_host`), so one
+counting rule governs the whole farm. A layer is bound to limits in its spec
+(or auto-tagged from failures, below); the candidate query carries the bound
+ids and `resolveLimitBudgets` reads every gating limit's budget once per tick
+**via the legacy gate's own CTE** (`DispatchQuery.LIMIT_USAGE_CTE`): settled
+usage plus the pending scan, in the limit's own unit.
 
-    CUE_LICENSES=hengine,katana
+An ENFORCED **FRAME** limit yields a frame budget (`max_value - usage`),
+spent tick-wide as candidates book. An ENFORCED **HOST** limit yields the
+holder set — the license server's reported holders union every host of ours
+running a bound layer — and a seat cap: above the threshold (`soft_value`
+when set, else `max_value`) only holding machines may book, and a per-limit
+seat bonus packs limited work onto the fewest machines (all frames on a
+seated machine share its one checkout). An in-tick gate steers placement and
+a commit-time trim enforces the numbers exactly (the plan read is
+limit-blind, like folder ceilings).
 
-and is placed only while the **license server** says seats are free. The
-declaration is the switch — there is no enable flag to forget — and layers that
-declare nothing are untouched. A static Limit cannot do this job: the pool is
-shared with consumers Cuebot never sees (artist workstations, CI, other farms),
-so only the server knows what is free.
+A limit that is ADVISORY or DISABLED, or whose external report has gone
+stale past `int_report_ttl`, gets **no budget at all**: Maestro books through
+it exactly as the legacy dispatcher would. Live license-server numbers reach
+the limit tables through the external reporting API (see the
+*Licenses and limits* developer guide and `samples/licensing/`): a reporter
+feeds per-host holds into `limit_host` and its capture time into
+`ts_reported`, and the settle-window pending scan keeps the two dispatchers
+counting our own recent bookings identically.
 
-`LicenseSource` polls a site provider off the hot path, on every Cuebot (so a
-promoted standby is warm):
-
-    maestro.license.provider=http://lic-reporter:9101/licenses
-    maestro.license.provider=script:/site/bin/cue_licenses.sh
-
-Either flavour returns the same JSON:
-
-    {"queried_at": 1690000000,
-     "licenses": [{"name": "hengine", "feature": "Houdini Engine",
-                   "total": 800, "available": 794, "host_based": false,
-                   "hosts": [{"host": "wolf1018", "count": 1}]}]}
-
-`queried_at` is when the numbers were true (epoch seconds; used to age the
-sample). It is REQUIRED: a response without a usable timestamp is rejected and
-the previous sample keeps aging toward stale, so a provider re-serving a cached
-payload can never look fresh forever. `available` is server truth, already net of every consumer, ours
-included. `hosts` is optional by design — sesictrl only reports checkouts per
-user — so counts-only providers are fully supported; when present it lets a
-machine licensed outside the cue (an artist's workstation that is also a render
-node) be recognized as free to place on. Seats are per frame (**floating**) or
-per machine (**host_based**: all frames on a seated machine share its one
-checkout, and a per-pool seat bonus packs licensed work onto the fewest
-machines).
-
-Maestro corrects the always-stale sample before spending it: it subtracts
-**in-flight** (our own frames started since the sample, derived from the
-database so any Cuebot computes the same numbers — what makes licensing survive
-failover) and per-license **headroom** (seats kept for interactive users).
-host_based caps are bounded via `available`, never the total, so a counts-only
-provider cannot be oversubscribed. An in-tick gate steers placement and a
-commit-time trim enforces the numbers exactly (the plan read is license-blind,
-like folder ceilings). Stale sample, unknown license, or no provider while a
-layer asks for one: that work is **held**, never run blind.
-
-A frame that exits with a status listed in
-`maestro.license.denied_exit_statuses` (a site's render wrapper maps the
-vendor's "no license" signal to a sentinel code) is requeued WAITING without
-spending a retry, so a busy pool never marches a layer to DEAD.
+A frame that exits with a status claimed by a limit's **failure rule** is
+requeued WAITING **without spending a retry** (the stored status becomes
+SKIP_RETRY): it hit a contended resource, not a broken frame, so a busy pool
+never marches a layer to DEAD. The rule also writes the layer-level booking
+backoff and, with auto-tag on, binds the layer to the limit so coverage is
+learned from failures.
 
 ### 3.7 Cache warmth (windowed locality)
 
@@ -443,7 +426,7 @@ of the host's current tenants, and live (full strength) always outranks
 warm (decayed), so mixed hosts keep their tenants while homeless layers are
 steered to hosts warm for them specifically. Over time layers acquire "home"
 machines: less mixing, slower decay on those homes, stronger homes. This
-never fights utilization — fit, reservations, tags and licenses are all
+never fights utilization — fit, reservations, tags and limits are all
 filtered before any bonus is scored, so warmth only breaks ties among hosts
 that could all take the work.
 
@@ -479,8 +462,8 @@ waitlist the tick actually weighed. `flowing` = the layer booked this tick, its
 backlog is moving. `capacity` = the farm is simply full (the group's idle cores
 cannot cover one frame; nothing is wrong). `no fit` = idle cores exist but none
 fits (slivers too small for a wide frame, or memory / gpu short): the shape
-mismatch worth investigating. `limit` = a job, show, limit or folder cap.
-`no license` = a pool is exhausted or stale. `held` = every fitting host is
+mismatch worth investigating. `limit` = a job, show or folder cap. `no license` = an enforced
+limit's budget (frame tokens or machine seats) is exhausted. `held` = every fitting host is
 reserved for a wide job. The buckets reuse the why-not precedence
 (`waitlistReason`), cost no extra query, and are published as the gauge
 `cue_maestro_waiting_frames{reason}`. The "What's holding frames" Grafana
@@ -673,15 +656,7 @@ already takes most of the load off it.
 | `maestro.locality_bonus` | `8.0` | Score bonus for a co-located host. Applied after fit/reservation filtering, so it never overrides them. |
 | `maestro.locality_window_frames` | `64` | Cache-warmth window (§3.7): a vacated host keeps a decayed pull on its layer until this many foreign frames have displaced its cache. 0 disables. |
 | `maestro.stat_interval_seconds` | `300` | Cadence of the consolidated INFO `Maestro stat:` line (Maestro health, farm fill, throughput, reservations). Lower it for live debugging. |
-| `maestro.license.provider` | (unset) | Where live license counts come from: an http endpoint or `script:<cmd>` wrapping a vendor CLI. Unset while layers declare `CUE_LICENSES`: those layers are held and a warning names them. |
-| `maestro.license.poll_seconds` | `20` | Provider poll cadence (every Cuebot polls). |
-| `maestro.license.timeout_seconds` | `10` | Hard deadline on one provider call; a hung CLI is killed. |
-| `maestro.license.stale_seconds` | `300` | Sample age past which Maestro fails closed and holds licensed layers. |
-| `maestro.license.inflight_pad_seconds` | `5` | Padding on the in-flight window, covering providers that timestamp their response after collection. |
-| `maestro.license.headroom.<name>` | `0` | Seats withheld per license for interactive users (default via `headroom.default`). |
-| `maestro.license.env_key` | `CUE_LICENSES` | Layer environment key carrying the license names. |
-| `maestro.license.denied_exit_statuses` | (empty) | Exit codes meaning "could not get a license": such frames requeue WAITING without spending a retry. |
-| `maestro.host_limit_seat_bonus` | `16.0` | Score bonus per host_based license pool the host already holds a seat in; packs licensed work onto the fewest machines. |
+| `maestro.host_limit_seat_bonus` | `16.0` | Score bonus per HOST-type limit the host already holds a seat in; packs limited work onto the fewest machines. |
 | `maestro.layer_host_max_frac` | `0.25` | SOFT per-host layer cap: one layer may hold at most this fraction of a host's cores (as frames, floor 8), so a flood spills across hosts instead of blanketing one. The cap yields when it is the only blocker: a fitting idle host that only the cap refuses is given to the layer (rss-proven layers only), so a lone farm-sized layer fills the farm instead of stranding it. On a busy farm no such host exists and the cap holds. 0 disables. |
 | `maestro.mem_per_core` | `0` | Memory-per-core ratio (KB) for rss-driven layer sizing (§3.9). 0 (the default) derives it from each group's own hosts; set e.g. 4194304 to pin 4G/core studio-wide. |
 | `maestro.plan_zero_warn_ticks` | `40` | Consecutive ticks a layer may plan but commit zero frames before a WARN names it (a commit-time gate Maestro does not model is rejecting it). |

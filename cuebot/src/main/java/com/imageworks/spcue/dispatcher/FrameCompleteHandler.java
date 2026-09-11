@@ -19,10 +19,8 @@ import java.time.Duration;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Random;
-import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -166,17 +164,6 @@ public class FrameCompleteHandler {
         this.satisfyDependOnlyOnFrameSuccess = satisfyDependOnlyOnFrameSuccess;
     }
 
-    /**
-     * Exit statuses that mean "the application could not get a license", from
-     * {@code maestro.license.denied_exit_statuses}. Vendor specific, so it is a site setting; EMPTY
-     * by default, which leaves frame-completion behaviour exactly as it was.
-     *
-     * Static because {@link #determineFrameState} is static and is the natural place for the
-     * decision. Written once when this bean is constructed, long before any report can arrive, and
-     * only read afterwards.
-     */
-    private static volatile Set<Integer> licenseDeniedStatuses = Collections.emptySet();
-
     public Map<Integer, Duration> getDelayRules() {
         return delayRules;
     }
@@ -203,12 +190,6 @@ public class FrameCompleteHandler {
                     + entry.getValue().toMinutes() + ", autoTag=True). Until then this entry "
                     + "keeps working unless a limit claims the status.");
         }
-        licenseDeniedStatuses =
-                parseStatuses(env.getProperty("maestro.license.denied_exit_statuses", ""));
-        if (!licenseDeniedStatuses.isEmpty()) {
-            logger.info("license-denied exit statuses (requeued without spending a retry): "
-                    + licenseDeniedStatuses);
-        }
         OomMemoryTracker.INSTANCE.configure(
                 env.getProperty("dispatcher.oom_frame_bump_expire_hours", Long.class,
                         OomMemoryTracker.DEFAULT_EXPIRE_HOURS),
@@ -224,31 +205,19 @@ public class FrameCompleteHandler {
                 }, new ThreadPoolExecutor.CallerRunsPolicy());
     }
 
-    /** Parse a comma separated list of exit statuses, ignoring blanks and junk. */
-    private static Set<Integer> parseStatuses(String csv) {
-        if (csv == null || csv.trim().isEmpty())
-            return Collections.emptySet();
-        Set<Integer> out = new HashSet<>();
-        for (String part : csv.split(",")) {
-            String str = part.trim();
-            if (str.isEmpty())
-                continue;
-            try {
-                out.add(Integer.valueOf(str));
-            } catch (NumberFormatException e) {
-                logger.warn("ignoring non-numeric maestro.license.denied_exit_statuses entry '"
-                        + str + "'");
-            }
-        }
-        return out;
-    }
-
     /**
-     * Did this frame exit because no application license was free? Always false unless the site
-     * configured the statuses, so this cannot change behaviour on its own.
+     * Did this frame exit because a limit's resource (typically an application license) was
+     * unavailable? True when a limit's failure rule with a booking backoff claims the exit status:
+     * the frame hit a contended resource, not a broken frame, so it is requeued WAITING without
+     * spending a retry. A pure-discovery rule (delay 0) deliberately does not change
+     * frame-completion behaviour.
      */
-    private static boolean isLicenseDenied(int exitStatus) {
-        return licenseDeniedStatuses.contains(exitStatus);
+    private boolean isLimitDenied(int exitStatus) {
+        if (limitRuleCache == null) {
+            return false;
+        }
+        LimitRule rule = limitRuleCache.forExitStatus(exitStatus);
+        return rule != null && rule.delayMinutes > 0;
     }
 
     /**
@@ -345,11 +314,11 @@ public class FrameCompleteHandler {
             final FrameDetail frameDetail =
                     jobManager.getFrameDetail(report.getFrame().getFrameId());
             final DispatchFrame frame = jobManager.getDispatchFrame(report.getFrame().getFrameId());
-            final FrameState newFrameState =
-                    determineFrameState(job, layer, frame, report, frameDetail, delayRules);
+            final FrameState newFrameState = determineFrameState(job, layer, frame, report,
+                    frameDetail, effectiveDelayRules());
             int exitStatus = resolveExitStatus(report, frameDetail);
-            if (isLicenseDenied(exitStatus)) {
-                logger.info("frame " + frame.getName() + " could not get a license (exit "
+            if (isLimitDenied(exitStatus)) {
+                logger.info("frame " + frame.getName() + " hit a limit's failure rule (exit "
                         + exitStatus + "); requeueing without spending a retry");
                 exitStatus = FrameExitStatus.SKIP_RETRY_VALUE;
             }
@@ -466,11 +435,11 @@ public class FrameCompleteHandler {
                     frameDetail, effectiveDelayRules());
 
             int exitStatus = resolveExitStatus(report, frameDetail);
-            // License-denied frames persist SKIP_RETRY: the retry increment
+            // Limit-denied frames persist SKIP_RETRY: the retry increment
             // reads the STORED exit status, so recording the vendor's code
-            // would spend a retry on a queue wait.
-            if (isLicenseDenied(exitStatus)) {
-                logger.info("frame " + frame.getName() + " could not get a license (exit "
+            // would spend a retry on a license queue wait.
+            if (isLimitDenied(exitStatus)) {
+                logger.info("frame " + frame.getName() + " hit a limit's failure rule (exit "
                         + exitStatus + "); requeueing without spending a retry");
                 exitStatus = FrameExitStatus.SKIP_RETRY_VALUE;
             }
@@ -1338,13 +1307,6 @@ public class FrameCompleteHandler {
             return FrameState.SUCCEEDED;
         }
 
-        if (isLicenseDenied(report.getExitStatus())) {
-            // No license free: a contended resource, not a broken frame.
-            // Requeue WAITING without burning a retry. This catches the
-            // race Maestro's gate cannot: an artist taking the last
-            // seat between the sample and the checkout.
-            return FrameState.WAITING;
-        }
         if (report.getExitStatus() == FrameExitStatus.SKIP_RETRY_VALUE
                 || (job.maxRetries != 0 && report.getExitSignal() == 119)) {
             return FrameState.WAITING;

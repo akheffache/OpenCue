@@ -564,8 +564,8 @@ public class DispatcherDaoJdbc extends JdbcDaoSupport implements DispatcherDao {
                         .addValue("threadMode", threadMode(host.threadMode))
                         .addValue("gpusAvailable", host.idleGpus)
                         .addValue("gpuMemoryAvailable", host.idleGpuMemory)
-                        .addValue("layerId", layer.getLayerId())
-                        .addValue("frameOffset", offset).addValue("frameLimit", offset + limit),
+                        .addValue("layerId", layer.getLayerId()).addValue("frameOffset", offset)
+                        .addValue("frameLimit", offset + limit),
                 FrameDaoJdbc.DISPATCH_FRAME_MAPPER);
         prometheusMetrics.setBookingDurationMetric("findNextDispatchFrames by layer and host query",
                 System.currentTimeMillis() - lastTime);
